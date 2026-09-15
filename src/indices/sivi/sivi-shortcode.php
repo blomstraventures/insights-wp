@@ -53,7 +53,7 @@ add_shortcode( 'blomstra_sivi_index', function () {
          data-biw-score-label="Vulnerability Score"
          data-biw-coverage-key="coverage"
          data-biw-band-thresholds="25,50,75"
-         data-biw-band-labels="Low,Medium,High,Extreme"
+         data-biw-band-labels="Very Good,Good,Poor,Very Poor"
          data-biw-band-select-label="All Vulnerability Levels"
          data-biw-pillars='<?php echo esc_attr( $pillars_json ); ?>'
          data-biw-methodology="<?php echo esc_attr( $methodology ); ?>"
