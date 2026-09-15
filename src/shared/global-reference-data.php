@@ -532,6 +532,22 @@ if ( ! function_exists( 'blomstra_comtrade_fetch_partner_imports_batch' ) ) {
 
                 if ( $http_code === 403 ) {
                     $body_snip = substr( $body_raw, 0, 300 );
+                    // BUGFIX (2026-09): UN Comtrade returns HTTP 403 for
+                    // BOTH a genuinely bad/expired key AND for exceeding
+                    // your call volume quota - every 403 was previously
+                    // treated as a permanent, bad-key failure regardless.
+                    // Quota exhaustion is temporary and resets on its own
+                    // (Comtrade's own response says when) - inspect the
+                    // body to tell the two apart before giving up on the
+                    // key entirely.
+                    if ( stripos( $body_snip, 'quota' ) !== false ) {
+                        $replenish_note = '';
+                        if ( preg_match( '/replenished in\s+([0-9:]+)/i', $body_snip, $m ) ) {
+                            $replenish_note = ' (resets in ' . $m[1] . ')';
+                        }
+                        blomstra_log_comtrade_call( $chunk_label, $year, 'quota_exhausted', 'HTTP 403 — call volume quota exhausted' . $replenish_note . ': ' . $body_snip );
+                        return BLOMSTRA_COMTRADE_QUOTA_EXHAUSTED;
+                    }
                     blomstra_log_comtrade_call( $chunk_label, $year, 'authorization_error', 'HTTP 403, likely invalid/expired key or permission issue: ' . $body_snip );
                     return BLOMSTRA_COMTRADE_PERMANENT_FAILURE;
                 }
@@ -656,6 +672,7 @@ if ( ! function_exists( 'blomstra_get_hhi_pointer' ) ) {
             'pending_iso3s'  => array(),
             'attempts'       => array(),
             'started_at'     => null,
+            'cycle_runs'     => 0,
         );
         $pointer = get_option( 'blomstra_hhi_refresh_pointer', $default );
         if ( ! is_array( $pointer ) || ! isset( $pointer['target_year'] ) ) {
@@ -664,17 +681,21 @@ if ( ! function_exists( 'blomstra_get_hhi_pointer' ) ) {
         if ( ! isset( $pointer['attempts'] ) ) {
             $pointer['attempts'] = array();
         }
+        if ( ! isset( $pointer['cycle_runs'] ) ) {
+            $pointer['cycle_runs'] = 0;
+        }
         return $pointer;
     }
 }
 
 if ( ! function_exists( 'blomstra_update_hhi_pointer' ) ) {
-    function blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts = array(), $started_at = null ) {
+    function blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts = array(), $started_at = null, $cycle_runs = 0 ) {
         $pointer = array(
             'target_year'   => $target_year,
             'pending_iso3s' => $pending_iso3s,
             'attempts'      => $attempts,
             'started_at'    => $started_at ? $started_at : current_time( 'mysql' ),
+            'cycle_runs'    => $cycle_runs,
         );
         update_option( 'blomstra_hhi_refresh_pointer', $pointer, false );
     }
@@ -705,6 +726,18 @@ if ( ! function_exists( 'blomstra_get_eia_raw_data' ) ) {
 if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
     function blomstra_refresh_comtrade_hhi_data( $year = null, $iso3_list = null, $force = false ) {
         $run_started = current_time( 'mysql' );
+        // BUGFIX (2026-09): voluntarily stop well before PHP's own
+        // execution time limit, the same way quota exhaustion already
+        // does — a run with many rate-limited retries and their backoff
+        // waits can otherwise hit a hard PHP timeout mid-chunk, which
+        // kills the process before it ever reaches the status-update code
+        // at the end. That leaves the admin status frozen on "RUNNING"
+        // indefinitely, with no error surfaced, since nothing ever runs
+        // again to correct it. Stopping gracefully at a safe internal
+        // budget means the pointer is saved and a proper 'partial' status
+        // is always reported, exactly like the quota-exhaustion path.
+        $function_start_time = time();
+        $time_budget_seconds = 480;
         if ( function_exists( 'set_time_limit' ) ) {
             @set_time_limit( 900 );
         }
@@ -747,19 +780,53 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
         $target_year = $pointer['target_year'];
         $pending_iso3s = $pointer['pending_iso3s'];
         $attempts = isset( $pointer['attempts'] ) ? $pointer['attempts'] : array();
+        $cycle_runs = isset( $pointer['cycle_runs'] ) ? $pointer['cycle_runs'] : 0;
 
         // v2.9.1 FIX (REF-BUG-7): $force previously accepted but never
         // referenced — every call behaved identically regardless of its
-        // value, even though the cron handler always passes force=true
-        // expecting a full fresh pass. Now it actually does one.
+        // value. BUGFIX (2026-09): the cron handler no longer always
+        // passes force=true (see its call site) — this now only resets on
+        // a genuinely empty pointer or a new year's target, as intended.
         if ( $force || empty( $pending_iso3s ) || $target_year != $year ) {
             $pending_iso3s = $fetchable_iso3s;
             $target_year = $year;
             $attempts = array_fill_keys( $pending_iso3s, 0 );
-            blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started );
+            $cycle_runs = 0;
+            blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started, $cycle_runs );
         }
 
+        // BUGFIX (2026-09): hard backstop, independent of the two fixes
+        // above — after a generous number of resumptions with no genuine
+        // per-country progress logic ever going wrong again in some way
+        // not yet discovered, force this cycle to a definite end rather
+        // than allow indefinite resumption under any circumstance. 30
+        // resumptions is far beyond what a normal week's quota/network
+        // hiccups should ever require.
+        $cycle_runs++;
+        if ( $cycle_runs > 30 && ! empty( $pending_iso3s ) ) {
+            error_log( 'HHI: cycle_runs exceeded 30 for target_year ' . $target_year . ' with ' . count( $pending_iso3s ) . ' countries still pending — force-terminating this cycle to guarantee it cannot loop indefinitely.' );
+            $forced_results = array();
+            foreach ( $pending_iso3s as $iso3 ) {
+                $forced_results[ $iso3 ] = array(
+                    'value' => null,
+                    'scale' => '0-10000',
+                    'requested_year' => $target_year,
+                    'actual_year' => null,
+                    'source' => 'force-terminated after 30 cycle resumptions',
+                    'last_updated' => current_time( 'mysql' ),
+                );
+            }
+            update_option( $staging_key, array_merge( $existing_cache, array_filter( $forced_results, function( $entry ) {
+                return isset( $entry['value'] ) && $entry['value'] !== null;
+            } ) ), false );
+            blomstra_delete_hhi_pointer();
+            $pending_iso3s = array();
+        }
+
+        blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started, $cycle_runs );
+
         $quota_dead = false;
+        $time_budget_exceeded = false;
         $results = array();
         $summary = array(
             'run_started'          => $run_started,
@@ -789,10 +856,21 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
         $chunks = array_chunk( $pending_iso3s, BLOMSTRA_HHI_CHUNK_SIZE );
         $total_chunks = count( $chunks );
 
-        for ( $chunk_idx = 0; $chunk_idx < $total_chunks && ! $quota_dead; $chunk_idx++ ) {
+        for ( $chunk_idx = 0; $chunk_idx < $total_chunks && ! $quota_dead && ! $time_budget_exceeded; $chunk_idx++ ) {
             $chunk_iso3s = $chunks[ $chunk_idx ];
             if ( empty( $chunk_iso3s ) ) {
                 continue;
+            }
+
+            if ( ( time() - $function_start_time ) > $time_budget_seconds ) {
+                $time_budget_exceeded = true;
+                $remaining_now = array();
+                for ( $ci = $chunk_idx; $ci < $total_chunks; $ci++ ) {
+                    $remaining_now = array_merge( $remaining_now, $chunks[ $ci ] );
+                }
+                blomstra_update_hhi_pointer( $target_year, $remaining_now, $attempts, $run_started, $cycle_runs );
+                error_log( 'HHI: stopping gracefully at ' . $time_budget_seconds . 's internal time budget, ' . count( $remaining_now ) . ' countries remaining — will resume next run.' );
+                break;
             }
 
             $chunk_codes = array();
@@ -820,7 +898,7 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
 
             if ( empty( $chunk_codes ) ) {
                 $pending_iso3s = array_diff( $pending_iso3s, $chunk_iso3s );
-                blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started );
+                blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started, $cycle_runs );
                 update_option( $staging_key, array_merge( $existing_cache, $results ), false );
                 continue;
             }
@@ -838,12 +916,42 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
                 if ( $rows === BLOMSTRA_COMTRADE_QUOTA_EXHAUSTED ) {
                     $quota_dead = true;
                     $state_counts['quota'] += count( $chunk_codes );
+                    // BUGFIX (2026-09): this used to discard the current
+                    // chunk's countries without classifying them or ever
+                    // incrementing their attempt count — that increment
+                    // only ever happened via the normal had_error path
+                    // below, which this early exit skipped entirely. Even
+                    // with the resumption fix above, a chunk that happens
+                    // to sit right where quota runs out on multiple
+                    // separate weeks could still make zero progress toward
+                    // BLOMSTRA_HHI_MAX_ATTEMPTS forever. Crediting this as
+                    // a real attempt — the same as any other interrupted
+                    // try — guarantees eventual termination.
                     foreach ( $chunk_codes as $code ) {
                         $iso3 = $chunk_map[ $code ];
                         $country_states[ $iso3 ] = 'QUOTA_FAILURE';
                         $summary['skipped_quota']++;
+                        $attempts[ $iso3 ] = isset( $attempts[ $iso3 ] ) ? $attempts[ $iso3 ] + 1 : 1;
+                        if ( $attempts[ $iso3 ] >= BLOMSTRA_HHI_MAX_ATTEMPTS ) {
+                            $state_counts['unresolved']++;
+                            $country_states[ $iso3 ] = 'UNRESOLVED';
+                            $results[ $iso3 ] = array(
+                                'value' => null,
+                                'scale' => '0-10000',
+                                'requested_year' => $target_year,
+                                'actual_year' => null,
+                                'source' => 'unresolved after ' . $attempts[ $iso3 ] . ' retries (repeatedly interrupted by quota)',
+                                'last_updated' => current_time( 'mysql' ),
+                            );
+                            unset( $attempts[ $iso3 ] );
+                            $pending_iso3s = array_diff( $pending_iso3s, array( $iso3 ) );
+                        }
                     }
-                    blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started );
+                    $valid_results_on_quota = array_filter( $results, function( $entry ) {
+                        return is_array( $entry ) && isset( $entry['value'] ) && $entry['value'] !== null;
+                    } );
+                    update_option( $staging_key, array_merge( $existing_cache, $valid_results_on_quota ), false );
+                    blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started, $cycle_runs );
                     break 2;
                 }
 
@@ -966,7 +1074,18 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
             } ) ) );
             $pending_iso3s = array_diff( $pending_iso3s, $processed );
 
-            $merged_cache = array_merge( $existing_cache, $results );
+            // BUGFIX (2026-09): only a genuinely successful result may
+            // overwrite an existing cached value. array_merge() previously
+            // let a null-valued placeholder for a failed country
+            // (permanent_failure/unresolved/no_data) silently overwrite
+            // that country's last known-good value in staging, and the
+            // promotion gate below counted raw array keys rather than
+            // valid values — together, a 100%-failure run could wipe
+            // production data with nulls while reporting "success."
+            $valid_results = array_filter( $results, function( $entry ) {
+                return is_array( $entry ) && isset( $entry['value'] ) && $entry['value'] !== null;
+            } );
+            $merged_cache = array_merge( $existing_cache, $valid_results );
             update_option( $staging_key, $merged_cache, false );
 
             $summary['last_checkpoint'] = current_time( 'mysql' );
@@ -974,7 +1093,7 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
             update_option( 'blomstra_hhi_refresh_summary', $summary, false );
 
             if ( ! $quota_dead ) {
-                blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started );
+                blomstra_update_hhi_pointer( $target_year, $pending_iso3s, $attempts, $run_started, $cycle_runs );
             }
 
             usleep( 500000 );
@@ -1012,13 +1131,20 @@ if ( ! function_exists( 'blomstra_refresh_comtrade_hhi_data' ) ) {
 
         $staging_data = get_option( $staging_key, array() );
         if ( ! empty( $staging_data ) && is_array( $staging_data ) ) {
-            $staging_count = count( $staging_data );
+            // BUGFIX (2026-09): count entries with a real, non-null value —
+            // not raw array-key count. Staging should no longer contain
+            // null-valued entries at all after the merge fix above, but
+            // this filter is kept as a defensive second check so this gate
+            // can never again be satisfied by placeholder rows alone.
+            $staging_count = count( array_filter( $staging_data, function( $entry ) {
+                return is_array( $entry ) && isset( $entry['value'] ) && $entry['value'] !== null;
+            } ) );
             $min_expected = max( 1, (int) ( $total_fetchable * 0.8 ) );
             if ( $staging_count >= $min_expected ) {
                 update_option( $production_key, $staging_data, false );
-                error_log( 'HHI: Atomic promotion succeeded – ' . $staging_count . ' countries staged, ' . $total_fetchable . ' expected.' );
+                error_log( 'HHI: Atomic promotion succeeded – ' . $staging_count . ' countries with valid data staged, ' . $total_fetchable . ' expected.' );
             } else {
-                error_log( 'HHI: Staging validation failed – ' . $staging_count . ' countries staged, expected at least ' . $min_expected . '. Production unchanged.' );
+                error_log( 'HHI: Staging validation failed – only ' . $staging_count . ' countries with valid data staged, expected at least ' . $min_expected . '. Production unchanged.' );
             }
         }
         delete_option( $staging_key );
@@ -1046,7 +1172,22 @@ if ( ! function_exists( 'blomstra_cron_handle_hhi' ) ) {
                 @set_time_limit( 900 );
             }
 
-            blomstra_refresh_comtrade_hhi_data( null, null, true );
+            // BUGFIX (2026-09): this call always passed force=true, which
+            // unconditionally resets pending_iso3s to ALL fetchable
+            // countries and attempts to zero on EVERY invocation — including
+            // the debounced 60-second self-reschedule below, whose entire
+            // purpose is to RESUME a run that quota interrupted. Since both
+            // the original weekly trigger and every resumption tick call
+            // this identical hook, resumption could never actually work:
+            // the very next tick always wiped whatever progress was saved.
+            // This is the real, root cause of countries staying "pending"
+            // forever — they were always past wherever quota ran out, and
+            // the process restarted from zero before ever reaching them
+            // again. The function's own internal logic (a few lines into
+            // blomstra_refresh_comtrade_hhi_data) already resets correctly
+            // on its own when appropriate — an empty pointer, or a new
+            // year's target — so forcing it here was never actually needed.
+            blomstra_refresh_comtrade_hhi_data( null, null, false );
 
             $summary   = get_option( 'blomstra_hhi_refresh_summary', array() );
             $succeeded = $summary['succeeded'] ?? 0;
@@ -1062,13 +1203,26 @@ if ( ! function_exists( 'blomstra_cron_handle_hhi' ) ) {
 
             $all_terminal = ! $has_retryable && $is_complete;
 
+            // BUGFIX (2026-09): a run where every fetchable country
+            // permanently failed (e.g. a rejected/expired Comtrade key)
+            // previously satisfied "$is_complete && $all_terminal" — since
+            // permanent_failure isn't counted as a retryable state — and
+            // was reported as 'success' with no check on $succeeded at
+            // all. Distinguish "finished with nothing left to retry" from
+            // "finished because everything failed."
+            $total_permanent = $state_counts['permanent_failure'] ?? 0;
+            $all_failed = ( $fetchable > 0 && $succeeded === 0 && $total_permanent >= $fetchable );
+
             $actual_cached = count( blomstra_get_comtrade_hhi_data() );
             $msg = 'HHI: ' . $succeeded . ' of ' . $fetchable . ' fetchable countries succeeded this run (' . $actual_cached . ' total now cached).';
             if ( ! empty( $state_counts ) ) {
                 $msg .= ' States: ' . http_build_query( $state_counts, '', ', ' );
             }
 
-            if ( $is_complete && $all_terminal ) {
+            if ( $all_failed ) {
+                blomstra_update_cron_status( 'hhi', 'error', $msg . ' All fetchable countries returned permanent_failure — check UN Comtrade API credentials/subscription (use "Test Comtrade" in Settings).', $actual_cached );
+                blomstra_delete_hhi_pointer();
+            } elseif ( $is_complete && $all_terminal ) {
                 blomstra_update_cron_status( 'hhi', 'success', $msg, $actual_cached );
                 blomstra_delete_hhi_pointer();
             } elseif ( $succeeded > 0 || $is_complete ) {
@@ -1613,7 +1767,21 @@ if ( ! function_exists( 'blomstra_cron_handle_eia' ) ) {
                        "Fuels completed: {$fuels_done} of {$total_fuels}.";
 
             if ( $is_complete ) {
-                blomstra_update_cron_status( 'eia', 'success', "All fuels processed. $message", $total_fuels );
+                // BUGFIX (2026-09): "all fuels processed" (pointer reached
+                // the end) was previously reported as 'success'
+                // unconditionally — even if every fuel permanently failed
+                // (e.g. a rejected/expired EIA key) — since the pointer
+                // still advances past a permanently-failed fuel. Check how
+                // many fuels actually ended up marked permanently failed
+                // before calling the run a success.
+                $permanently_failed_fuels = count( array_filter( $pointer['failed_fuels'] ?? array(), function( $f ) {
+                    return is_array( $f ) && ! empty( $f['permanent'] );
+                } ) );
+                if ( $permanently_failed_fuels >= $total_fuels ) {
+                    blomstra_update_cron_status( 'eia', 'error', "All {$total_fuels} fuels permanently failed — check EIA API credentials (use \"Test EIA\" in Settings). $message", 0 );
+                } else {
+                    blomstra_update_cron_status( 'eia', 'success', "All fuels processed. $message", $total_fuels );
+                }
                 blomstra_delete_eia_pointer();
             } else {
                 $status_display = ( $result['status'] === 'retryable' ) ? 'retryable' : 'partial';
@@ -2434,20 +2602,29 @@ if ( ! function_exists( 'blomstra_fetch_wb_historical_batch' ) ) {
 
 if ( ! function_exists( 'blomstra_get_wb_pointer' ) ) {
     function blomstra_get_wb_pointer() {
-        $default = array( 'next_index' => 0, 'started_at' => null );
+        // BUGFIX (2026-09): added 'failed_total' so a run's cumulative
+        // failure count survives across ticks — previously only the
+        // current tick's batch of 3 was ever checked, so a run whose
+        // final batch happened to succeed was reported as a full success
+        // even if every earlier batch in the same run had failed.
+        $default = array( 'next_index' => 0, 'started_at' => null, 'failed_total' => 0 );
         $pointer = get_option( 'blomstra_wb_refresh_pointer', $default );
         if ( ! is_array( $pointer ) || ! isset( $pointer['next_index'] ) ) {
             $pointer = $default;
+        }
+        if ( ! isset( $pointer['failed_total'] ) ) {
+            $pointer['failed_total'] = 0;
         }
         return $pointer;
     }
 }
 
 if ( ! function_exists( 'blomstra_update_wb_pointer' ) ) {
-    function blomstra_update_wb_pointer( $next_index, $started_at = null ) {
+    function blomstra_update_wb_pointer( $next_index, $started_at = null, $failed_total = 0 ) {
         $pointer = array(
-            'next_index' => $next_index,
-            'started_at' => $started_at ? $started_at : current_time( 'mysql' ),
+            'next_index'   => $next_index,
+            'started_at'   => $started_at ? $started_at : current_time( 'mysql' ),
+            'failed_total' => $failed_total,
         );
         update_option( 'blomstra_wb_refresh_pointer', $pointer, false );
     }
@@ -2505,6 +2682,8 @@ if ( ! function_exists( 'blomstra_cron_handle_wb_indicators' ) ) {
 
             $pointer = blomstra_get_wb_pointer();
             $start_index = $pointer['next_index'];
+            $run_started = $pointer['started_at'];
+            $failed_total_before = ( $start_index === 0 ) ? 0 : ( $pointer['failed_total'] ?? 0 );
             $batch_size = 3;
             $end_index = min( $start_index + $batch_size, $total );
 
@@ -2523,14 +2702,28 @@ if ( ! function_exists( 'blomstra_cron_handle_wb_indicators' ) ) {
                 } else {
                     $failed_count++;
                 }
-                blomstra_update_wb_pointer( $i + 1 );
                 sleep( 1 );
             }
+
+            $failed_total = $failed_total_before + $failed_count;
+            blomstra_update_wb_pointer( $end_index, $run_started, $failed_total );
 
             $msg = "Processed indicators $start_index to " . ( $end_index - 1 ) . " of $total. Success: $success_count, Failed: $failed_count.";
 
             if ( $end_index >= $total ) {
-                blomstra_update_cron_status( 'wb_indicators', 'success', "All $total indicators refreshed. $msg", $total );
+                // BUGFIX (2026-09): "pointer reached the end of the
+                // indicator list" was previously reported as 'success'
+                // unconditionally, even when every indicator across the
+                // whole run — not just this tick's batch of 3 — had
+                // failed. Use the cumulative failure count tracked across
+                // all ticks of this run, not just the current batch.
+                if ( $failed_total >= $total ) {
+                    blomstra_update_cron_status( 'wb_indicators', 'error', "All $total indicators failed this run. $msg", 0 );
+                } elseif ( $failed_total > 0 ) {
+                    blomstra_update_cron_status( 'wb_indicators', 'partial', "$total indicators processed, $failed_total failed overall this run. $msg", $total - $failed_total );
+                } else {
+                    blomstra_update_cron_status( 'wb_indicators', 'success', "All $total indicators refreshed. $msg", $total );
+                }
                 blomstra_delete_wb_pointer();
             } else {
                 blomstra_update_cron_status( 'wb_indicators', 'partial', "Partial: $msg", $end_index );
@@ -2716,19 +2909,46 @@ if ( ! function_exists( 'blomstra_ref_handle_early_actions' ) ) {
         }
 
         if ( isset( $_POST['blomstra_save_api_credentials'] ) && check_admin_referer( 'blomstra_save_api_credentials_action', 'blomstra_save_api_credentials_nonce' ) ) {
+            // BUGFIX (2026-09): credential fields are now rendered blank on
+            // page load (see the form below) instead of echoing the real
+            // secret back into the page's HTML source. That means a blank
+            // submitted value here means "user didn't type a new key," not
+            // "user wants to clear the key" — so a field left blank keeps
+            // whatever's already effectively configured (DB value or
+            // wp-config.php constant), and only a non-empty submission
+            // overwrites it. Without this change, simply loading and
+            // re-saving the settings page (e.g. to change one field) would
+            // blank out every other credential.
             $credentials = array();
 
-            if ( isset( $_POST['blomstra_comtrade_subscription_key'] ) ) {
-                $credentials['comtrade']['subscription_key'] = sanitize_text_field( trim( $_POST['blomstra_comtrade_subscription_key'] ) );
-            }
+            $submitted_comtrade_key = isset( $_POST['blomstra_comtrade_subscription_key'] ) ? sanitize_text_field( trim( $_POST['blomstra_comtrade_subscription_key'] ) ) : '';
+            $credentials['comtrade']['subscription_key'] = ( $submitted_comtrade_key !== '' )
+                ? $submitted_comtrade_key
+                : (string) blomstra_get_api_credential( 'comtrade', 'subscription_key' );
 
-            if ( isset( $_POST['blomstra_eia_api_key'] ) ) {
-                $credentials['eia']['api_key'] = sanitize_text_field( trim( $_POST['blomstra_eia_api_key'] ) );
-            }
+            $submitted_eia_key = isset( $_POST['blomstra_eia_api_key'] ) ? sanitize_text_field( trim( $_POST['blomstra_eia_api_key'] ) ) : '';
+            $credentials['eia']['api_key'] = ( $submitted_eia_key !== '' )
+                ? $submitted_eia_key
+                : (string) blomstra_get_api_credential( 'eia', 'api_key' );
 
-            if ( isset( $_POST['blomstra_unctad_client_id'] ) || isset( $_POST['blomstra_unctad_client_secret'] ) ) {
-                $credentials['unctad']['client_id'] = isset( $_POST['blomstra_unctad_client_id'] ) ? sanitize_text_field( trim( $_POST['blomstra_unctad_client_id'] ) ) : '';
-                $credentials['unctad']['client_secret'] = isset( $_POST['blomstra_unctad_client_secret'] ) ? sanitize_text_field( trim( $_POST['blomstra_unctad_client_secret'] ) ) : '';
+            $submitted_unctad_id = isset( $_POST['blomstra_unctad_client_id'] ) ? sanitize_text_field( trim( $_POST['blomstra_unctad_client_id'] ) ) : '';
+            $credentials['unctad']['client_id'] = ( $submitted_unctad_id !== '' )
+                ? $submitted_unctad_id
+                : (string) blomstra_get_api_credential( 'unctad', 'client_id' );
+
+            $submitted_unctad_secret = isset( $_POST['blomstra_unctad_client_secret'] ) ? sanitize_text_field( trim( $_POST['blomstra_unctad_client_secret'] ) ) : '';
+            $credentials['unctad']['client_secret'] = ( $submitted_unctad_secret !== '' )
+                ? $submitted_unctad_secret
+                : (string) blomstra_get_api_credential( 'unctad', 'client_secret' );
+
+            // Explicit clear: checking this box is the only way to blank a
+            // stored credential now that leaving the field empty means
+            // "unchanged."
+            if ( ! empty( $_POST['blomstra_clear_comtrade_key'] ) ) {
+                $credentials['comtrade']['subscription_key'] = '';
+            }
+            if ( ! empty( $_POST['blomstra_clear_eia_key'] ) ) {
+                $credentials['eia']['api_key'] = '';
             }
 
             blomstra_save_api_credentials( $credentials );
@@ -3259,27 +3479,54 @@ if ( ! function_exists( 'blomstra_ref_render_page' ) ) {
         echo '<form method="post" style="margin-bottom:15px;">';
         wp_nonce_field( 'blomstra_save_api_credentials_action', 'blomstra_save_api_credentials_nonce' );
 
+        // BUGFIX (2026-09): the real credential value used to be printed
+        // straight into the input's value="" attribute. type="password"
+        // only masks it on screen — the plaintext key was still sitting in
+        // the page's rendered HTML, visible via "View Source" or devtools
+        // regardless of the dots shown on screen. Fields now render blank
+        // with a "currently configured" indicator instead of the secret
+        // itself; submitting the form with the field left blank keeps the
+        // existing key unchanged (see the save handler above). A reveal
+        // toggle is meaningful now, since the field genuinely doesn't leak
+        // the stored value until a new one is typed.
         $comtrade_key = $api_creds['comtrade']['subscription_key'] ?? '';
+        $comtrade_configured = $comtrade_key !== '';
+        // Show a safe hint (last 4 characters only) so a saved key doesn't
+        // feel like it vanished — never the full value, per the plaintext-
+        // exposure fix above.
+        $comtrade_hint = $comtrade_configured ? ' (••••' . substr( $comtrade_key, -4 ) . ')' : '';
         echo '<div style="background:#f9f9f9; padding:12px 16px; border:1px solid #ddd; border-radius:4px; margin-bottom:12px;">';
         echo '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">';
         echo '<div><strong>UN Comtrade (HHI Pillar)</strong> <span style="color:#666; font-weight:normal; font-size:12px;">— Subscription Key required</span></div>';
+        echo '<span style="font-size:12px; font-weight:600; color:' . ( $comtrade_configured ? '#2e7d32' : '#d63638' ) . ';">' . ( $comtrade_configured ? 'CONFIGURED ✓' . esc_html( $comtrade_hint ) : 'NOT CONFIGURED ✗' ) . '</span>';
         echo '</div>';
         echo '<div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:6px;">';
         echo '<label style="font-weight:500;">Subscription Key:</label>';
-        echo '<input type="password" name="blomstra_comtrade_subscription_key" value="' . esc_attr( $comtrade_key ) . '" style="flex:1; min-width:200px; padding:6px 10px; border:1px solid #ddd; border-radius:4px;" placeholder="Enter Comtrade subscription key">';
+        echo '<input type="password" id="biw_comtrade_key_input" name="blomstra_comtrade_subscription_key" value="" style="flex:1; min-width:200px; padding:6px 10px; border:1px solid #ddd; border-radius:4px;" placeholder="' . ( $comtrade_configured ? 'Leave blank to keep current key' : 'Enter Comtrade subscription key' ) . '" autocomplete="new-password">';
+        echo '<button type="button" onclick="var f=document.getElementById(\'biw_comtrade_key_input\'); f.type = (f.type===\'password\') ? \'text\' : \'password\';" class="button" title="Show/hide" style="padding:2px 10px;">👁</button>';
         echo '</div>';
+        if ( $comtrade_configured ) {
+            echo '<label style="display:block; margin-top:6px; font-size:12px; color:#666;"><input type="checkbox" name="blomstra_clear_comtrade_key" value="1"> Clear the stored key (falls back to wp-config.php constant if one is defined)</label>';
+        }
 		echo '<p style="color:#666; font-size:12px; margin:6px 0 0 0;">ℹ️ Required for Supplier Concentration pillar. <a href="https://comtradedeveloper.un.org/signin" target="_blank">Get a key →</a></p>';
         echo '</div>';
 
         $eia_key = $api_creds['eia']['api_key'] ?? '';
+        $eia_configured = $eia_key !== '';
+        $eia_hint = $eia_configured ? ' (••••' . substr( $eia_key, -4 ) . ')' : '';
         echo '<div style="background:#f9f9f9; padding:12px 16px; border:1px solid #ddd; border-radius:4px; margin-bottom:12px;">';
         echo '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">';
         echo '<div><strong>EIA Energy Data (Energy Pillar)</strong> <span style="color:#666; font-weight:normal; font-size:12px;">— API Key required</span></div>';
+        echo '<span style="font-size:12px; font-weight:600; color:' . ( $eia_configured ? '#2e7d32' : '#d63638' ) . ';">' . ( $eia_configured ? 'CONFIGURED ✓' . esc_html( $eia_hint ) : 'NOT CONFIGURED ✗' ) . '</span>';
         echo '</div>';
         echo '<div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:6px;">';
         echo '<label style="font-weight:500;">API Key:</label>';
-        echo '<input type="password" name="blomstra_eia_api_key" value="' . esc_attr( $eia_key ) . '" style="flex:1; min-width:200px; padding:6px 10px; border:1px solid #ddd; border-radius:4px;" placeholder="Enter EIA API key">';
+        echo '<input type="password" id="biw_eia_key_input" name="blomstra_eia_api_key" value="" style="flex:1; min-width:200px; padding:6px 10px; border:1px solid #ddd; border-radius:4px;" placeholder="' . ( $eia_configured ? 'Leave blank to keep current key' : 'Enter EIA API key' ) . '" autocomplete="new-password">';
+        echo '<button type="button" onclick="var f=document.getElementById(\'biw_eia_key_input\'); f.type = (f.type===\'password\') ? \'text\' : \'password\';" class="button" title="Show/hide" style="padding:2px 10px;">👁</button>';
         echo '</div>';
+        if ( $eia_configured ) {
+            echo '<label style="display:block; margin-top:6px; font-size:12px; color:#666;"><input type="checkbox" name="blomstra_clear_eia_key" value="1"> Clear the stored key (falls back to wp-config.php constant if one is defined)</label>';
+        }
         echo '<p style="color:#666; font-size:12px; margin:6px 0 0 0;">ℹ️ Required for Energy Dependency pillar. <a href="https://www.eia.gov/opendata/" target="_blank">Get a key →</a></p>';
         echo '</div>';
 
@@ -3957,6 +4204,27 @@ if ( ! function_exists( 'blomstra_ref_render_page' ) ) {
         echo '<p id="cache-job-preview" style="margin-top:10px; color:#666; font-size:13px;"></p>';
         echo '</form>';
         echo '</div></div>';
+        // BUGFIX (2026-09): this used to embed a literal inline PHP tag
+        // calling wp_nonce_field(...) directly inside a JavaScript string
+        // in the script block below. That tag was real, executable PHP —
+        // it ran once, server-side, at page-render time, and injected the
+        // nonce field's raw HTML output straight into the middle of the
+        // rendered script tag's text, corrupting the JavaScript syntax
+        // around it. A PHP tag embedded in client-side JS can never work
+        // as "generate a fresh nonce when the button is clicked" anyway,
+        // since PHP has already finished running by then — the correct
+        // fix is to compute the nonce once here, server-side, and hand it
+        // to JS as a value. FURTHER FIX (2026-09-10): the first version of
+        // this fix used an embedded inline PHP echo tag in the middle of
+        // the raw-HTML/script block below — that broke on the live
+        // WPCode-snippet deployment (WPCode strips inline PHP tag pairs
+        // wherever they appear in a snippet, not just at the start/end,
+        // which disconnected this variable from its value). Emitting it
+        // via a plain echo, before the raw-HTML block begins, avoids any
+        // embedded tag entirely and matches how every other dynamic value
+        // in this file is already output safely.
+        $cache_job_retry_nonce_field = wp_nonce_field( 'blomstra_cache_job_action', 'blomstra_cache_job_nonce', true, false );
+        echo '<script>var cacheJobRetryNonceField = ' . wp_json_encode( $cache_job_retry_nonce_field ) . ';</script>';
         ?>
         <script>
         jQuery(document).ready(function($) {
@@ -3987,7 +4255,7 @@ if ( ! function_exists( 'blomstra_ref_render_page' ) ) {
                         '<input type="hidden" name="blomstra_cache_job_retry" value="1">' +
                         '<input type="hidden" name="source" value="' + source + '">' +
                         '<input type="hidden" name="year" value="' + year + '">' +
-                        '<?php wp_nonce_field( 'blomstra_cache_job_action', 'blomstra_cache_job_nonce' ); ?>' +
+                        cacheJobRetryNonceField +
                         '</form>');
                     $('body').append(form);
                     form.submit();
