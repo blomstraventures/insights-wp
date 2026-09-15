@@ -105,9 +105,15 @@ if (!window.BIW_COUNTRY_GROUPS) {
         var pillars = [];
         try { pillars = JSON.parse(root.getAttribute('data-biw-pillars') || '[]'); } catch (e) { pillars = []; }
         var bandThresholds = (root.getAttribute('data-biw-band-thresholds') || '25,50,75').split(',').map(Number);
-        var bandLabels = (root.getAttribute('data-biw-band-labels') || 'Low,Medium,High,Extreme').split(',');
-        var bandClasses = ['biw-badge-low', 'biw-badge-medium', 'biw-badge-high', 'biw-badge-extreme'];
+        var bandLabels = (root.getAttribute('data-biw-band-labels') || 'Very Good,Good,Poor,Very Poor').split(',');
+        var bandClasses = ['biw-badge-verygood', 'biw-badge-good', 'biw-badge-poor', 'biw-badge-verypoor'];
         var scoreLabel = root.getAttribute('data-biw-score-label') || 'Vulnerability Score';
+        // NEW (2026-09): generic support for indices where a HIGH score is
+        // GOOD rather than bad (e.g. a resilience index vs. a vulnerability
+        // index), sharing this same engine. Defaults preserve exactly the
+        // existing behavior for any index that doesn't set these.
+        var orientation = root.getAttribute('data-biw-orientation') || 'higher_is_worse'; // or 'higher_is_better'
+        var metricName = root.getAttribute('data-biw-metric-name') || 'Vulnerability';
         var methodology = root.getAttribute('data-biw-methodology') || '';
 
         var minYear = parseInt(root.getAttribute('data-biw-year-min')) || 2004;
@@ -357,11 +363,11 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '  <input type="text" class="biw-search" placeholder="Search countries…">' +
                 '  <div class="biw-table-controls">' +
                 '    <select class="biw-select biw-region-filter" id="biw-region-filter"><option value="all">All regions</option><option value="Africa">Africa</option><option value="Americas">Americas</option><option value="Asia">Asia</option><option value="Europe">Europe</option><option value="Oceania">Oceania</option></select>' +
-                '    <select class="biw-select biw-band-filter"><option value="all">All vulnerability levels</option>' +
-                '      <option value="0">' + esc(bandLabels[0]) + '</option>' +
-                '      <option value="1">' + esc(bandLabels[1]) + '</option>' +
-                '      <option value="2">' + esc(bandLabels[2]) + '</option>' +
-                '      <option value="3">' + esc(bandLabels[3]) + '</option>' +
+                '    <select class="biw-select biw-band-filter"><option value="all">All ' + metricName.toLowerCase() + ' levels</option>' +
+                '      <option value="0">' + esc(bandLabels[orientedBandIndex(0)]) + '</option>' +
+                '      <option value="1">' + esc(bandLabels[orientedBandIndex(1)]) + '</option>' +
+                '      <option value="2">' + esc(bandLabels[orientedBandIndex(2)]) + '</option>' +
+                '      <option value="3">' + esc(bandLabels[orientedBandIndex(3)]) + '</option>' +
                 '    </select>' +
                 '    <select class="biw-select biw-sort-select">' +
                 '      <option value="rank">Sort: Rank</option>' +
@@ -403,7 +409,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '    <div id="biw-score-detail"></div>' +
                 '  </div>' +
                 '  <div class="biw-summary-card" id="biw-dist-card">' +
-                '    <b class="card-title">Vulnerabilities</b>' +
+                '    <b class="card-title">' + esc(metricName) + ' Levels</b>' +
                 '    <div class="biw-distribution-grid" id="biw-dist-inline"></div>' +
                 '  </div>' +
                 '  <div class="biw-summary-card" id="biw-mover-card">' +
@@ -440,19 +446,19 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '      <button class="play-btn" id="biw-play-btn">▶</button>' +
                 '    </div>' +
                 '    <div class="biw-legend-horizontal">' +
-                '      <span class="legend-item"><span class="legend-dot" style="background:var(--biw-low)"></span> Low</span>' +
-                '      <span class="legend-item"><span class="legend-dot" style="background:var(--biw-medium)"></span> Medium</span>' +
-                '      <span class="legend-item"><span class="legend-dot" style="background:var(--biw-high)"></span> High</span>' +
-                '      <span class="legend-item"><span class="legend-dot" style="background:var(--biw-extreme)"></span> Extreme</span>' +
+                '      <span class="legend-item"><span class="legend-dot" style="background:' + orientedBandColors()[0] + '"></span> ' + esc(bandLabels[orientedBandIndex(0)] || 'Very Good') + '</span>' +
+                '      <span class="legend-item"><span class="legend-dot" style="background:' + orientedBandColors()[1] + '"></span> ' + esc(bandLabels[orientedBandIndex(1)] || 'Good') + '</span>' +
+                '      <span class="legend-item"><span class="legend-dot" style="background:' + orientedBandColors()[2] + '"></span> ' + esc(bandLabels[orientedBandIndex(2)] || 'Poor') + '</span>' +
+                '      <span class="legend-item"><span class="legend-dot" style="background:' + orientedBandColors()[3] + '"></span> ' + esc(bandLabels[orientedBandIndex(3)] || 'Very Poor') + '</span>' +
                 '      <span class="legend-item"><span class="legend-line"></span> No data</span>' +
                 '    </div>' +
                 '  </div>' +
                 '  <div class="biw-map-side">' +
                 '    <div class="biw-widget"><h4>Risk distribution</h4><div class="biw-donut" id="biw-donut"></div></div>' +
-                '    <div class="biw-widget"><h4>Vulnerability extremes</h4>' +
-                '      <div style="font-size:11px;color:var(--biw-slate-dim);margin-bottom:8px;">Most vulnerable (highest scores)</div>' +
+                '    <div class="biw-widget"><h4>' + esc(metricName) + ' extremes</h4>' +
+                '      <div style="font-size:11px;color:var(--biw-slate-dim);margin-bottom:8px;">Highest ' + esc(metricName) + '</div>' +
                 '      <div id="biw-most-vulnerable" class="biw-mover-list"></div>' +
-                '      <div style="font-size:11px;color:var(--biw-slate-dim);margin:8px 0;">Least vulnerable (lowest scores)</div>' +
+                '      <div style="font-size:11px;color:var(--biw-slate-dim);margin:8px 0;">Lowest ' + esc(metricName) + '</div>' +
                 '      <div id="biw-least-vulnerable" class="biw-mover-list"></div>' +
                 '    </div>' +
                 '  </div>' +
@@ -493,10 +499,10 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '      <div class="biw-histogram-bars" id="biw-histogram"></div>' +
                 '    </div>' +
                 '    <div class="biw-histogram-axis">' +
-                '      <div class="axis-band low">' + esc(bandLabels[0]) + ' 0–' + bandThresholds[0] + '</div>' +
-                '      <div class="axis-band med">' + esc(bandLabels[1]) + ' ' + bandThresholds[0] + '–' + bandThresholds[1] + '</div>' +
-                '      <div class="axis-band high">' + esc(bandLabels[2]) + ' ' + bandThresholds[1] + '–' + bandThresholds[2] + '</div>' +
-                '      <div class="axis-band ext">' + esc(bandLabels[3]) + ' ' + bandThresholds[2] + '+</div>' +
+                '      <div class="axis-band low">' + esc(bandLabels[orientedBandIndex(0)]) + ' 0–' + bandThresholds[0] + '</div>' +
+                '      <div class="axis-band med">' + esc(bandLabels[orientedBandIndex(1)]) + ' ' + bandThresholds[0] + '–' + bandThresholds[1] + '</div>' +
+                '      <div class="axis-band high">' + esc(bandLabels[orientedBandIndex(2)]) + ' ' + bandThresholds[1] + '–' + bandThresholds[2] + '</div>' +
+                '      <div class="axis-band ext">' + esc(bandLabels[orientedBandIndex(3)]) + ' ' + bandThresholds[2] + '+</div>' +
                 '    </div>' +
                 '  </div>' +
                 '</div>' +
@@ -506,11 +512,11 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '  <input type="text" class="biw-search" placeholder="Search countries…">' +
                 '  <div class="biw-table-controls">' +
                 '    <select class="biw-select biw-region-filter" id="biw-region-filter"><option value="all">All regions</option><option value="Africa">Africa</option><option value="Americas">Americas</option><option value="Asia">Asia</option><option value="Europe">Europe</option><option value="Oceania">Oceania</option></select>' +
-                '    <select class="biw-select biw-band-filter"><option value="all">All vulnerability levels</option>' +
-                '      <option value="0">' + esc(bandLabels[0]) + '</option>' +
-                '      <option value="1">' + esc(bandLabels[1]) + '</option>' +
-                '      <option value="2">' + esc(bandLabels[2]) + '</option>' +
-                '      <option value="3">' + esc(bandLabels[3]) + '</option>' +
+                '    <select class="biw-select biw-band-filter"><option value="all">All ' + metricName.toLowerCase() + ' levels</option>' +
+                '      <option value="0">' + esc(bandLabels[orientedBandIndex(0)]) + '</option>' +
+                '      <option value="1">' + esc(bandLabels[orientedBandIndex(1)]) + '</option>' +
+                '      <option value="2">' + esc(bandLabels[orientedBandIndex(2)]) + '</option>' +
+                '      <option value="3">' + esc(bandLabels[orientedBandIndex(3)]) + '</option>' +
                 '    </select>' +
                 '    <select class="biw-select biw-sort-select">' +
                 '      <option value="rank">Sort: Rank</option>' +
@@ -606,7 +612,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                             if (container) {
                                 var errDiv = document.createElement('div');
                                 errDiv.id = 'biw-d3-error';
-                                errDiv.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--biw-high);text-align:center;font-family:var(--biw-sans);z-index:20;background:rgba(0,0,0,0.8);padding:20px;border-radius:8px;';
+                                errDiv.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--biw-poor);text-align:center;font-family:var(--biw-sans);z-index:20;background:rgba(0,0,0,0.8);padding:20px;border-radius:8px;';
                                 errDiv.innerHTML = '<strong>⚠️ Visualisation engine failed to load</strong><br><span style="font-size:12px;">' + esc(state.d3Error) + '</span><br><span style="font-size:10px;color:var(--biw-slate-dim);">Check console for details.</span>';
                                 container.style.position = 'relative';
                                 container.appendChild(errDiv);
@@ -638,14 +644,42 @@ if (!window.BIW_COUNTRY_GROUPS) {
             return bandThresholds.length;
         }
 
+        // BUGFIX (2026-09): band labels changed from intensity-based
+        // ("Low"..."Extreme", which needed the reader to already know an
+        // index's direction to interpret as good or bad) to quality-based
+        // ("Very Good"..."Very Poor", which always means the same thing
+        // regardless of index). That means the label must now reverse
+        // together with the color for a higher-is-better index — unlike
+        // the old intensity-based labels, which stayed in direct score
+        // order on purpose. One shared index calculation for both.
+        function orientedBandIndex(b) {
+            return (orientation === 'higher_is_better') ? (bandLabels.length - 1 - b) : b;
+        }
+
         function getRiskLabel(score) {
             var b = band(score);
-            return bandLabels[b] || 'Unknown';
+            return bandLabels[orientedBandIndex(b)] || 'Unknown';
         }
 
         function getRiskClass(score) {
             var b = band(score);
-            return bandClasses[b] || 'biw-badge-low';
+            var idx = (orientation === 'higher_is_better') ? (bandClasses.length - 1 - b) : b;
+            return bandClasses[idx] || 'biw-badge-verygood';
+        }
+
+        // BUGFIX (2026-09): getCountryColor(), getColor(), the donut chart,
+        // the histogram, and the map legend each hardcoded their own copy
+        // of this same band-to-color array, independently of getRiskClass()
+        // above and of each other. None of the copies applied the
+        // orientation reversal — so for a higher-is-better index, some
+        // parts of the widget (whichever used getRiskClass) showed correct
+        // colors while every other part (map, drawer, movers list, scatter,
+        // donut, histogram, legend) still showed the un-reversed, backwards
+        // colors. One shared source of truth now; every call site below
+        // uses this instead of its own copy.
+        function orientedBandColors() {
+            var colors = ['var(--biw-verygood)', 'var(--biw-good)', 'var(--biw-poor)', 'var(--biw-verypoor)'];
+            return (orientation === 'higher_is_better') ? colors.slice().reverse() : colors;
         }
 
         // ─── Apply filters ──────────────────────────────────────────
@@ -740,18 +774,35 @@ if (!window.BIW_COUNTRY_GROUPS) {
         }
 
         function badgeHtml(score, coverage) {
-            var b = band(score);
             var cov = coverage === 'partial'
                 ? '<span class="biw-coverage biw-coverage-partial" title="Partial Index — one pillar estimated">PARTIAL</span>'
                 : (coverage ? '<span class="biw-coverage biw-coverage-full">FULL</span>' : '');
-            var cls = bandClasses[b];
+            // BUGFIX (2026-09): this was the SEVENTH hardcoded copy of the
+            // band-to-color logic (`bandClasses[band(score)]` directly) —
+            // and the most consequential one, since it's what renders the
+            // actual score badge in the table. It bypassed getRiskClass()
+            // entirely, so the table itself never got the orientation fix
+            // despite getRiskClass being correctly written all along.
+            var cls = getRiskClass(score);
             return '<span class="biw-badge-cell"><span class="biw-badge ' + cls + '">' + fmtNum(score) + '</span>' + cov + '</span>';
         }
 
         function rankHtml(c) {
+            var rd = c.rank_display;
+            // BUGFIX (2026-09): getRecomputedRank() always returns a
+            // definitive-looking number for ANY country with a score,
+            // regardless of coverage — it was running first and silently
+            // overriding the partial-coverage range (#38–52*) the backend
+            // computes specifically because that country's rank isn't
+            // fully certain. Pre-existing bug, not introduced by any of
+            // today's changes — affects SIVI and SERI equally since this
+            // is shared engine code neither index customizes.
+            if (c.coverage === 'partial' && rd && !rd.is_definitive) {
+                return '<span class="biw-rank-partial" title="80% range #' + rd.range_80_low + '–#' + rd.range_80_high +
+                    ' · theoretical #' + rd.theoretical_low + '–#' + rd.theoretical_high + '">' + rd.string_format + '</span>';
+            }
             var rank = getRecomputedRank(c.iso3, state.selectedYear);
             if (rank) return '#' + rank;
-            var rd = c.rank_display;
             if (rd && rd.is_definitive) {
                 return '<span>' + rd.string_format + '</span>';
             }
@@ -801,13 +852,30 @@ if (!window.BIW_COUNTRY_GROUPS) {
             return { type: delta > 0 ? 'up' : 'down', value: Math.abs(delta) };
         }
 
+        // BUGFIX (2026-09): the drawer had its own separate, hardcoded
+        // delta-color rendering (biw-delta-up/-down applied directly by
+        // arrow direction, no orientation check) — same bug class as the
+        // band-color duplicates above, just for delta arrows instead.
+        // Shared here so the table and the drawer can't drift apart again.
+        function deltaColorClass(deltaType) {
+            var movingTowardRank1 = (deltaType === 'up');
+            var isGoodMove = (orientation === 'higher_is_better') ? movingTowardRank1 : !movingTowardRank1;
+            return isGoodMove ? 'biw-delta-down' : 'biw-delta-up';
+        }
+
         function deltaHtml(c) {
             var info = deltaInfo(c);
             if (info.type === 'new') return '<span class="biw-delta biw-delta-new" title="No previous year data">NEW</span>';
             if (info.type === 'flat') return '<span class="biw-delta biw-delta-flat" title="No change in rank (compared among countries with data in both years)">—</span>';
             var arrow = info.type === 'up' ? '↑' : '↓';
-            var cls = info.type === 'up' ? 'biw-delta-up' : 'biw-delta-down';
-            var label = info.type === 'up' ? 'Rank worsened (more vulnerable)' : 'Rank improved (less vulnerable)';
+            var cls = deltaColorClass(info.type);
+            // BUGFIX (2026-09): this used to say "Rank worsened (more
+            // vulnerable)" / "Rank improved (less vulnerable)" — wording
+            // that's backwards for a higher-is-better index sharing this
+            // same engine (e.g. resilience, where moving toward #1 is
+            // good, not bad). Describing the movement itself, rather than
+            // judging it as better/worse, is correct for any index.
+            var label = info.type === 'up' ? 'Rank moved up, closer to #1' : 'Rank moved down, further from #1';
             return '<span class="biw-delta ' + cls + '" title="' + label + ' (compared among countries with data in both years)">' + arrow + info.value + '</span>';
         }
 
@@ -858,8 +926,8 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 countriesDetail.innerHTML =
                     '<div style="font-size:1rem;font-weight:700;">' + total + ' total</div>' +
                     '<div style="font-size:0.8rem;display:flex;gap:12px;margin-top:2px;">' +
-                    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--biw-low);border-radius:50%;margin-right:4px;"></span> ' + fullCount + ' full</span>' +
-                    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--biw-medium);border-radius:50%;margin-right:4px;"></span> ' + partialCount + ' partial</span>' +
+                    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--biw-verygood);border-radius:50%;margin-right:4px;"></span> ' + fullCount + ' full</span>' +
+                    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--biw-good);border-radius:50%;margin-right:4px;"></span> ' + partialCount + ' partial</span>' +
                     '</div>';
             }
 
@@ -896,11 +964,18 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
             var distInline = document.getElementById('biw-dist-inline');
             if (distInline) {
+                // BUGFIX (2026-09): this used fixed CSS classes
+                // (dist-dot extreme/high/medium/low) tied to fixed colors
+                // in the stylesheet, bypassing the same orientation
+                // reversal as everywhere else — sixth place this same bug
+                // showed up. Text stays in direct order (Extreme always
+                // means the highest-score band); only the dot color reverses.
+                var distColors = orientedBandColors();
                 distInline.innerHTML =
-                    '<span class="dist-item"><span class="dist-dot extreme"></span><span class="dist-num">' + ext + '</span> Extreme</span>' +
-                    '<span class="dist-item"><span class="dist-dot high"></span><span class="dist-num">' + high + '</span> High</span>' +
-                    '<span class="dist-item"><span class="dist-dot medium"></span><span class="dist-num">' + med + '</span> Medium</span>' +
-                    '<span class="dist-item"><span class="dist-dot low"></span><span class="dist-num">' + low + '</span> Low</span>';
+                    '<span class="dist-item"><span class="dist-dot" style="background:' + distColors[3] + '"></span><span class="dist-num">' + ext + '</span> Extreme</span>' +
+                    '<span class="dist-item"><span class="dist-dot" style="background:' + distColors[2] + '"></span><span class="dist-num">' + high + '</span> High</span>' +
+                    '<span class="dist-item"><span class="dist-dot" style="background:' + distColors[1] + '"></span><span class="dist-num">' + med + '</span> Medium</span>' +
+                    '<span class="dist-item"><span class="dist-dot" style="background:' + distColors[0] + '"></span><span class="dist-num">' + low + '</span> Low</span>';
             }
 
             // ─── Top movers ────────────────────────────────────────
@@ -928,11 +1003,17 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 });
 
                 var html = '';
+                // BUGFIX (2026-09): tenth instance of the same bug class —
+                // mover-up/mover-down were hardcoded (up=red, down=green)
+                // regardless of orientation. Swap which existing class
+                // applies, same pattern as deltaColorClass().
+                var upMoverClass = (orientation === 'higher_is_better') ? 'mover-down' : 'mover-up';
+                var downMoverClass = (orientation === 'higher_is_better') ? 'mover-up' : 'mover-down';
                 if (upMover) {
-                    html += '<div class="mover-up">🔺 ' + esc(upMover.country.name) + ' (▲' + upMover.delta + ')</div>';
+                    html += '<div class="' + upMoverClass + '">🔺 ' + esc(upMover.country.name) + ' (▲' + upMover.delta + ')</div>';
                 }
                 if (downMover) {
-                    html += '<div class="mover-down">🔻 ' + esc(downMover.country.name) + ' (▼' + downMover.delta + ')</div>';
+                    html += '<div class="' + downMoverClass + '">🔻 ' + esc(downMover.country.name) + ' (▼' + downMover.delta + ')</div>';
                 }
                 if (!upMover && !downMover) {
                     html = '<div style="color:var(--biw-slate-dim);font-size:0.8rem;">No significant moves</div>';
@@ -969,7 +1050,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
             var container = document.getElementById('biw-donut');
             if (!container || !state.d3Ready || typeof d3 === 'undefined') return;
 
-            var colors = ['var(--biw-low)', 'var(--biw-medium)', 'var(--biw-high)', 'var(--biw-extreme)'];
+            var colors = orientedBandColors();
             var scores = state.all.map(function (d) { return getScoreForYear(d.iso3, state.selectedYear) ?? d[scoreKey]; });
             var validScores = scores.filter(function (s) { return s !== null && s !== undefined; });
             var counts = [0, 0, 0, 0];
@@ -1000,7 +1081,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 .attr('stroke-width', 2)
                 .on('mouseenter', function (event, d) {
                     var idx = d.index;
-                    var label = bandLabels[idx] || 'Unknown';
+                    var label = bandLabels[orientedBandIndex(idx)] || 'Unknown';
                     var count = counts[idx] || 0;
                     var pct = total > 0 ? ((count / total) * 100).toFixed(1) : 0;
                     tooltip.innerHTML = '<strong>' + esc(label) + '</strong><br>' + count + ' countries (' + pct + '%)';
@@ -1071,10 +1152,11 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 var bar = document.createElement('div');
                 bar.className = 'biw-histogram-bar' + (count === 0 ? ' empty' : '');
                 bar.style.height = count > 0 ? (count / maxCount) * 100 + '%' : '0%';
-                if (start < bandThresholds[0]) bar.style.backgroundColor = 'var(--biw-low)';
-                else if (start < bandThresholds[1]) bar.style.backgroundColor = 'var(--biw-medium)';
-                else if (start < bandThresholds[2]) bar.style.backgroundColor = 'var(--biw-high)';
-                else bar.style.backgroundColor = 'var(--biw-extreme)';
+                var histColors = orientedBandColors();
+                if (start < bandThresholds[0]) bar.style.backgroundColor = histColors[0];
+                else if (start < bandThresholds[1]) bar.style.backgroundColor = histColors[1];
+                else if (start < bandThresholds[2]) bar.style.backgroundColor = histColors[2];
+                else bar.style.backgroundColor = histColors[3];
 
                 var countryNames = countriesInBin.map(function (d) { return d.name + ' (' + fmtNum(d.score) + ')'; }).slice(0, 12).join(', ');
                 var extraCount = count > 12 ? '\n...and ' + (count - 12) + ' more' : '';
@@ -1186,7 +1268,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
         function getColor(score) {
             var b = band(score);
-            return ['var(--biw-low)', 'var(--biw-medium)', 'var(--biw-high)', 'var(--biw-extreme)'][b] || 'var(--biw-slate-dim)';
+            return orientedBandColors()[b] || 'var(--biw-slate-dim)';
         }
 
         // ─── Map ──────────────────────────────────────────────────────
@@ -1411,7 +1493,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                                 var html = '<div style="font-weight:800;">' + esc(c.name) + '</div>' +
                                     '<div>Rank: ' + rankHtml(c) + '</div>' +
                                     '<div>' + esc(scoreLabel) + ': ' + fmtNum(score) + '</div>' +
-                                    '<div style="font-size:11px;color:' + getColor(score) + ';">' + bandLabels[band(score)] + '</div>' +
+                                    '<div style="font-size:11px;color:' + getColor(score) + ';">' + esc(getRiskLabel(score)) + '</div>' +
                                     '<hr style="border-color:var(--biw-border);margin:4px 0;">';
                                 // Add pillar rows
                                 pillars.forEach(function(p) {
@@ -1494,7 +1576,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
             }
             if (val == null) return 'var(--biw-no-data)';
             var b = band(val);
-            return ['var(--biw-low)', 'var(--biw-medium)', 'var(--biw-high)', 'var(--biw-extreme)'][b] || 'var(--biw-no-data)';
+            return orientedBandColors()[b] || 'var(--biw-no-data)';
         }
 
         // ─── Map markers ──────────────────────────────────────────
@@ -1517,14 +1599,39 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
             if (scored.length === 0) return;
 
-            var most = scored.reduce(function (a, b) { return a.score > b.score ? a : b; });
-            var least = scored.reduce(function (a, b) { return a.score < b.score ? a : b; });
-            var mover = scored.reduce(function (a, b) { return a.rankChange > b.rankChange ? a : b; });
+            // BUGFIX (2026-09): "most"/"least"/"mover" used to be picked
+            // purely by score/rank-change, then silently dropped later
+            // (line ~1660, "if (!feature) return;") if that specific
+            // country isn't present as its own polygon in the simplified
+            // world map — which is common for small territories (e.g.
+            // Macao SAR is often merged into China's shape in simplified
+            // world atlases). That produced fewer than 3 visible markers
+            // with no indication why. Now falls back to the next-best
+            // candidate whenever the top choice can't actually be placed.
+            function findFeatureFor(iso3) {
+                var features = state.mapFeatures || [];
+                return features.find(function (f) {
+                    return getIso3(f.id || f.properties?.id) === iso3;
+                });
+            }
+
+            var byScoreDesc = scored.slice().sort(function (a, b) { return b.score - a.score; });
+            var most = byScoreDesc.find(function (d) { return findFeatureFor(d.country.iso3); }) || byScoreDesc[0];
+
+            var byScoreAsc = scored.slice().sort(function (a, b) { return a.score - b.score; });
+            var least = byScoreAsc.find(function (d) { return findFeatureFor(d.country.iso3); }) || byScoreAsc[0];
+
+            var moverCandidates = scored.filter(function (d) {
+                return d.country.iso3 !== most.country.iso3 && d.country.iso3 !== least.country.iso3;
+            });
+            var moverPool = moverCandidates.length > 0 ? moverCandidates : scored;
+            var byRankChangeDesc = moverPool.slice().sort(function (a, b) { return b.rankChange - a.rankChange; });
+            var mover = byRankChangeDesc.find(function (d) { return findFeatureFor(d.country.iso3); }) || byRankChangeDesc[0];
 
             var markers = [
-                { country: most.country, label: 'Most vulnerable', color: '#9B59B6' },
-                { country: least.country, label: 'Least vulnerable', color: '#9B59B6' },
-                { country: mover.country, label: 'Biggest mover', color: '#9B59B6' }
+                { country: most.country, label: 'Highest scoring', color: '#22D3EE' },
+                { country: least.country, label: 'Lowest scoring', color: '#22D3EE' },
+                { country: mover.country, label: 'Biggest mover', color: '#22D3EE' }
             ];
 
             var unique = [];
@@ -1557,14 +1664,14 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 var glow = markerGroup.append('circle')
                     .attr('r', 10)
                     .attr('fill', 'none')
-                    .attr('stroke', '#9B59B6')
+                    .attr('stroke', '#22D3EE')
                     .attr('stroke-width', 3)
                     .style('opacity', 0.9)
                     .style('filter', 'drop-shadow(0 0 8px #8E44AD)');
 
                 markerGroup.append('circle')
                     .attr('r', 5)
-                    .attr('fill', '#9B59B6')
+                    .attr('fill', '#22D3EE')
                     .style('opacity', 1);
 
                 var pulse = function () {
@@ -1631,15 +1738,22 @@ if (!window.BIW_COUNTRY_GROUPS) {
             document.getElementById('drawer-score').textContent = score || '—';
 
             var rankEl = document.getElementById('drawer-rank');
-            var recomputedRank = getRecomputedRank(c.iso3, year);
-            if (recomputedRank) {
-                rankEl.textContent = '#' + recomputedRank;
-            } else if (rankDisplay && rankDisplay.string_format) {
+            // BUGFIX (2026-09): same fix as rankHtml() above — partial
+            // coverage must always show its range, not get silently
+            // overridden by the recomputed rank.
+            if (coverage === 'partial' && rankDisplay && !rankDisplay.is_definitive && rankDisplay.string_format) {
                 rankEl.innerHTML = rankDisplay.string_format;
-            } else if (rank !== undefined && rank !== null) {
-                rankEl.textContent = '#' + rank;
             } else {
-                rankEl.textContent = '—';
+                var recomputedRank = getRecomputedRank(c.iso3, year);
+                if (recomputedRank) {
+                    rankEl.textContent = '#' + recomputedRank;
+                } else if (rankDisplay && rankDisplay.string_format) {
+                    rankEl.innerHTML = rankDisplay.string_format;
+                } else if (rank !== undefined && rank !== null) {
+                    rankEl.textContent = '#' + rank;
+                } else {
+                    rankEl.textContent = '—';
+                }
             }
 
             var riskLabel = getRiskLabel(score);
@@ -1649,8 +1763,8 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
             var delta = deltaInfo(c);
             var deltaEl = document.getElementById('drawer-delta');
-            if (delta.type === 'up') deltaEl.innerHTML = '<span class="biw-delta-up">▲ ' + delta.value + '</span>';
-            else if (delta.type === 'down') deltaEl.innerHTML = '<span class="biw-delta-down">▼ ' + delta.value + '</span>';
+            if (delta.type === 'up') deltaEl.innerHTML = '<span class="' + deltaColorClass('up') + '">▲ ' + delta.value + '</span>';
+            else if (delta.type === 'down') deltaEl.innerHTML = '<span class="' + deltaColorClass('down') + '">▼ ' + delta.value + '</span>';
             else if (delta.type === 'flat') deltaEl.innerHTML = '<span class="biw-delta-flat">—</span>';
             else deltaEl.innerHTML = '<span class="biw-delta-new">NEW</span>';
 
@@ -1692,10 +1806,10 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 }
             });
             var whyText = maxPillar
-                ? 'Shows its primary vulnerability in <strong>' + esc(maxPillar) + '</strong> (' + fmtNum(maxVal) + ').'
+                ? 'Shows its largest contributing factor in <strong>' + esc(maxPillar) + '</strong> (' + fmtNum(maxVal) + ').'
                 : 'Balanced across pillars.';
             document.getElementById('drawer-why').innerHTML = '💡 <strong>Why this score?</strong> ' + whyText + ' ' +
-                (coverage === 'partial' ? '<br><em style="color:var(--biw-medium)">Partial coverage – rank is a projected range.</em>' : '');
+                (coverage === 'partial' ? '<br><em style="color:var(--biw-good)">Partial coverage – rank is a projected range.</em>' : '');
 
             renderRadar(c, year);
             renderHistoryChart(c);
@@ -2153,7 +2267,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 var g = svg.append('g').attr('transform', 'translate(140,140)');
                 var radius = 95;
                 var angleSlice = (Math.PI * 2) / pillars.length;
-                var colorPalette = ['var(--biw-low)', 'var(--biw-medium)', 'var(--biw-high)', 'var(--biw-extreme)', '#c084fc'];
+                var colorPalette = ['var(--biw-verygood)', 'var(--biw-good)', 'var(--biw-poor)', 'var(--biw-verypoor)', '#c084fc'];
 
                 for (var lvl = 1; lvl <= 5; lvl++) {
                     g.append('circle')
@@ -2569,8 +2683,8 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '<div class="block-stat-card"><span class="stat-label">Std Dev</span><span class="stat-value">' + fmtNum(stats.stddev) + '</span></div>' +
                 '</div>';
             html += '<div class="block-extremes">' +
-                '<div><strong>Most Vulnerable:</strong> <span class="block-country-link" data-iso3="' + stats.mostVuln.iso3 + '">' + esc(stats.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(stats.mostVuln.iso3, state.selectedYear) ?? stats.mostVuln[scoreKey]) + ')</div>' +
-                '<div><strong>Least Vulnerable:</strong> <span class="block-country-link" data-iso3="' + stats.leastVuln.iso3 + '">' + esc(stats.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(stats.leastVuln.iso3, state.selectedYear) ?? stats.leastVuln[scoreKey]) + ')</div>' +
+                '<div><strong>Highest scoring:</strong> <span class="block-country-link" data-iso3="' + stats.mostVuln.iso3 + '">' + esc(stats.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(stats.mostVuln.iso3, state.selectedYear) ?? stats.mostVuln[scoreKey]) + ')</div>' +
+                '<div><strong>Lowest scoring:</strong> <span class="block-country-link" data-iso3="' + stats.leastVuln.iso3 + '">' + esc(stats.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(stats.leastVuln.iso3, state.selectedYear) ?? stats.leastVuln[scoreKey]) + ')</div>' +
                 '</div>';
             html += '</div>';
             html += '</div>';
@@ -2582,8 +2696,8 @@ if (!window.BIW_COUNTRY_GROUPS) {
             if (!statsA || !statsB) return '<p style="color:var(--biw-slate-dim)">No data available for one of the groups.</p>';
             var diff = statsA.avg - statsB.avg;
             var diffText = diff > 0
-                ? statsA.name + ' is <strong>' + fmtNum(Math.abs(diff)) + '</strong> points more vulnerable on average'
-                : statsB.name + ' is <strong>' + fmtNum(Math.abs(diff)) + '</strong> points more vulnerable on average';
+                ? statsA.name + ' scores <strong>' + fmtNum(Math.abs(diff)) + '</strong> points higher on average'
+                : statsB.name + ' scores <strong>' + fmtNum(Math.abs(diff)) + '</strong> points higher on average';
             var html = '<div class="block-overview-content">';
             html += '<div class="block-overview-grid">';
             html += '<div class="block-overview-radar"><div id="block-radar-container" style="height:300px;"></div><div class="block-legend"><span class="legend-a">● ' + esc(statsA.name) + '</span><span class="legend-b">● ' + esc(statsB.name) + '</span></div></div>';
@@ -2594,10 +2708,10 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 '</div>';
             html += '<div class="block-diff-indicator"><span>📊 ' + diffText + '</span></div>';
             html += '<div class="block-extremes two-col">' +
-                '<div><strong>' + esc(statsA.name) + ' most vulnerable:</strong> <span class="block-country-link" data-iso3="' + statsA.mostVuln.iso3 + '">' + esc(statsA.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsA.mostVuln.iso3, state.selectedYear) ?? statsA.mostVuln[scoreKey]) + ')</div>' +
-                '<div><strong>' + esc(statsB.name) + ' most vulnerable:</strong> <span class="block-country-link" data-iso3="' + statsB.mostVuln.iso3 + '">' + esc(statsB.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsB.mostVuln.iso3, state.selectedYear) ?? statsB.mostVuln[scoreKey]) + ')</div>' +
-                '<div><strong>' + esc(statsA.name) + ' least vulnerable:</strong> <span class="block-country-link" data-iso3="' + statsA.leastVuln.iso3 + '">' + esc(statsA.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsA.leastVuln.iso3, state.selectedYear) ?? statsA.leastVuln[scoreKey]) + ')</div>' +
-                '<div><strong>' + esc(statsB.name) + ' least vulnerable:</strong> <span class="block-country-link" data-iso3="' + statsB.leastVuln.iso3 + '">' + esc(statsB.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsB.leastVuln.iso3, state.selectedYear) ?? statsB.leastVuln[scoreKey]) + ')</div>' +
+                '<div><strong>' + esc(statsA.name) + ' highest scoring:</strong> <span class="block-country-link" data-iso3="' + statsA.mostVuln.iso3 + '">' + esc(statsA.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsA.mostVuln.iso3, state.selectedYear) ?? statsA.mostVuln[scoreKey]) + ')</div>' +
+                '<div><strong>' + esc(statsB.name) + ' highest scoring:</strong> <span class="block-country-link" data-iso3="' + statsB.mostVuln.iso3 + '">' + esc(statsB.mostVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsB.mostVuln.iso3, state.selectedYear) ?? statsB.mostVuln[scoreKey]) + ')</div>' +
+                '<div><strong>' + esc(statsA.name) + ' lowest scoring:</strong> <span class="block-country-link" data-iso3="' + statsA.leastVuln.iso3 + '">' + esc(statsA.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsA.leastVuln.iso3, state.selectedYear) ?? statsA.leastVuln[scoreKey]) + ')</div>' +
+                '<div><strong>' + esc(statsB.name) + ' lowest scoring:</strong> <span class="block-country-link" data-iso3="' + statsB.leastVuln.iso3 + '">' + esc(statsB.leastVuln.name) + '</span> (' + fmtNum(getScoreForYear(statsB.leastVuln.iso3, state.selectedYear) ?? statsB.leastVuln[scoreKey]) + ')</div>' +
                 '</div>';
             html += '</div>';
             html += '</div>';
@@ -2757,7 +2871,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
             drawPoly(statsA, 'var(--biw-champagne)', -radius - 8);
             if (statsB) {
-                drawPoly(statsB, 'var(--biw-extreme)', -radius - 24);
+                drawPoly(statsB, 'var(--biw-verypoor)', -radius - 24);
             }
         }
 
@@ -2787,7 +2901,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
             var y = d3.scaleLinear().domain([0, 100]).rangeRound([innerHeight, 0]);
 
             var colorA = 'var(--biw-champagne)';
-            var colorB = 'var(--biw-extreme)';
+            var colorB = 'var(--biw-verypoor)';
 
             svg.append('g').attr('class', 'grid')
                 .call(d3.axisLeft(y).ticks(5).tickSize(-innerWidth).tickFormat(''))
@@ -2873,7 +2987,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
                     .attr('x', function(d, i) { return i * barWidth + 1; })
                     .attr('y', function(d) { return y(d); })
                     .attr('width', barWidth - 3).attr('height', function(d) { return innerHeight - y(d); })
-                    .attr('fill', 'var(--biw-extreme)').attr('opacity', 0.55);
+                    .attr('fill', 'var(--biw-verypoor)').attr('opacity', 0.55);
             }
 
             bandThresholds.forEach(function(t) {
@@ -2889,7 +3003,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
             legend.append('rect').attr('width', 10).attr('height', 10).attr('fill', 'var(--biw-champagne)');
             legend.append('text').attr('x', 14).attr('y', 9).style('font-size', '10px').style('fill', 'var(--biw-text)').text(statsA.name);
             if (statsB) {
-                legend.append('rect').attr('y', 14).attr('width', 10).attr('height', 10).attr('fill', 'var(--biw-extreme)');
+                legend.append('rect').attr('y', 14).attr('width', 10).attr('height', 10).attr('fill', 'var(--biw-verypoor)');
                 legend.append('text').attr('x', 14).attr('y', 23).style('font-size', '10px').style('fill', 'var(--biw-text)').text(statsB.name);
             }
         }
@@ -2911,7 +3025,7 @@ if (!window.BIW_COUNTRY_GROUPS) {
             if (statsB) data.push({ label: statsB.name, value: statsB.avg });
             var xScale = d3.scaleBand().domain(data.map(function(d) { return d.label; })).range([0, innerWidth]).padding(0.3);
             var yScale = d3.scaleLinear().domain([0, Math.max(100, d3.max(data, function(d) { return d.value; }) * 1.2)]).range([innerHeight, 0]);
-            var colors = ['var(--biw-champagne)', 'var(--biw-extreme)'];
+            var colors = ['var(--biw-champagne)', 'var(--biw-verypoor)'];
             svg.selectAll('rect').data(data).enter().append('rect')
                 .attr('x', function(d) { return xScale(d.label); })
                 .attr('y', function(d) { return yScale(d.value); })
@@ -3001,14 +3115,28 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
             var darkBtn = document.getElementById('biw-dark-toggle');
             if (darkBtn) {
+                // BUGFIX (2026-09): state.isDark defaults to false (light)
+                // at initialization above, but this code only ever added
+                // the CSS class needed to actually render light mode when
+                // localStorage explicitly said 'light' — a first-time
+                // visitor with nothing saved got dark mode by default
+                // (the base, class-less CSS) despite the JS state saying
+                // otherwise. Light is now the true default; only an
+                // explicit saved 'dark' preference switches away from it.
                 try {
                     var pref = localStorage.getItem('biw_dark_mode_' + slug);
-                    if (pref === 'light') {
+                    if (pref === 'dark') {
+                        state.isDark = true;
+                        root.classList.remove('biw-light');
+                        darkBtn.innerHTML = '<span class="icon">🌙</span> Dark';
+                    } else {
                         state.isDark = false;
                         root.classList.add('biw-light');
                         darkBtn.innerHTML = '<span class="icon">☀️</span> Light';
                     }
-                } catch (e) {}
+                } catch (e) {
+                    root.classList.add('biw-light');
+                }
                 darkBtn.addEventListener('click', toggleDark);
             }
 
