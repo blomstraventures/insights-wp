@@ -30,7 +30,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────
 
-define( 'SERI_VERSION', '4.3.0' );
+// METHODOLOGY CHANGE (2026-09): v5.0.0 inverts every indicator's polarity
+// so a HIGH composite score now means MORE resilient (previously, high
+// meant more at-risk, matching a risk-score convention that contradicted
+// this index's own name and its public methodology text). This is a
+// Major version bump per the documentation constitution's change-
+// management rule — it changes the meaning of every historical score,
+// not just the display. See seri_build_composite() for the per-indicator
+// detail.
+define( 'SERI_VERSION', '5.0.0' );
 define( 'SERI_OPTION_KEY', 'seri_composite_index' );
 define( 'SERI_CRON_HOOK', 'seri_weekly_refresh' );
 define( 'SERI_DAILY_CRON_HOOK', 'seri_daily_cron' );
@@ -760,12 +768,17 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
     $percentiles = array();
 
     // Governance
+    // METHODOLOGY CHANGE (2026-09, BMS-1.2.0): governance indicators were
+    // previously inverted (100 - raw) so that a HIGH percentile meant BAD
+    // governance, matching a risk-score convention. SERI is a resilience
+    // index — a high composite score should mean MORE resilient, not more
+    // at-risk. Raw WGI values are already high=good, so used directly now.
     $gov_indicators = array_keys( $weight_defs['governance']['indicators'] );
     foreach ( $gov_indicators as $ind ) {
         $values = array();
         foreach ( $rows as $iso3 => $row ) {
             if ( isset( $row[ $ind ] ) && is_numeric( $row[ $ind ] ) ) {
-                $values[ $iso3 ] = 100 - $row[ $ind ];
+                $values[ $iso3 ] = $row[ $ind ];
             }
         }
         // BMS-1.1.0: winsor level now read from config (§2.8), not hardcoded.
@@ -774,15 +787,18 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
     }
 
     // Macro
+    // METHODOLOGY CHANGE (2026-09, BMS-1.2.0): every indicator's polarity
+    // flipped so a HIGH percentile now means more resilient/stable, not
+    // more at-risk — see the governance pillar comment above for why.
     $macro_indicators = array_keys( $weight_defs['macro']['indicators'] );
     foreach ( $macro_indicators as $ind ) {
         $values = array();
         foreach ( $rows as $iso3 => $row ) {
             if ( isset( $row[ $ind ] ) && is_numeric( $row[ $ind ] ) ) {
                 if ( $ind === 'gni_growth' ) {
-                    $values[ $iso3 ] = - $row[ $ind ];
-                } else {
                     $values[ $iso3 ] = $row[ $ind ];
+                } else {
+                    $values[ $iso3 ] = - $row[ $ind ];
                 }
             }
         }
@@ -792,17 +808,19 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
     }
 
     // External
+    // METHODOLOGY CHANGE (2026-09, BMS-1.2.0): polarity flipped, see the
+    // governance pillar comment above.
     $ext_indicators = array_keys( $weight_defs['external']['indicators'] );
     foreach ( $ext_indicators as $ind ) {
         $values = array();
         foreach ( $rows as $iso3 => $row ) {
             if ( isset( $row[ $ind ] ) && is_numeric( $row[ $ind ] ) ) {
                 if ( $ind === 'reserve_months' || $ind === 'current_account' ) {
-                    $values[ $iso3 ] = - $row[ $ind ];
+                    $values[ $iso3 ] = $row[ $ind ];
                 } elseif ( $ind === 'external_debt' ) {
-                    $values[ $iso3 ] = $row[ $ind ];
+                    $values[ $iso3 ] = - $row[ $ind ];
                 } elseif ( $ind === 'gni_gdp_divergence' ) {
-                    $values[ $iso3 ] = $row[ $ind ];
+                    $values[ $iso3 ] = - $row[ $ind ];
                 }
             }
         }
@@ -812,15 +830,17 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
     }
 
     // Fiscal
+    // METHODOLOGY CHANGE (2026-09, BMS-1.2.0): polarity flipped, see the
+    // governance pillar comment above.
     $fisc_indicators = array_keys( $weight_defs['fiscal']['indicators'] );
     foreach ( $fisc_indicators as $ind ) {
         $values = array();
         foreach ( $rows as $iso3 => $row ) {
             if ( isset( $row[ $ind ] ) && is_numeric( $row[ $ind ] ) ) {
                 if ( $ind === 'gov_balance' ) {
-                    $values[ $iso3 ] = - $row[ $ind ];
-                } else {
                     $values[ $iso3 ] = $row[ $ind ];
+                } else {
+                    $values[ $iso3 ] = - $row[ $ind ];
                 }
             }
         }
@@ -1114,8 +1134,18 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
             }
         }
 
-        // Sort ascending: lowest score = most resilient = rank #1
-        asort( $full_countries );
+        // BUGFIX (2026-09): this comment and the asort() below were correct
+        // under SERI's OLD polarity (before the v5.0.0 methodology flip),
+        // where a lower score meant more resilient. Since every indicator
+        // was inverted so a HIGH score now means more resilient, rank #1
+        // must go to the HIGHEST score, matching every other index on this
+        // engine. This is the actual root cause of a real, reported bug:
+        // partial-coverage countries were showing wildly wrong rank ranges
+        // (e.g. a country scoring in full-country-rank-~30 territory
+        // showing a range like #103–155) because full-coverage countries
+        // were still being sorted and ranked by the pre-flip direction.
+        // Sort descending: highest score = most resilient = rank #1
+        arsort( $full_countries );
         $full_composites_sorted = array_values( $full_countries );
         $full_rank_map = array();
         $i = 1;
@@ -1178,16 +1208,21 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
 
             $ranks_by_injection = array();
             foreach ( $hypothetical_composites as $point => $hyp_composite ) {
-                // NOTE: deliberately NOT calling blomstra_rank_in_full_index()
-                // here. Reference Data's real implementation takes only
-                // ($score, $full_composites_sorted) — no direction parameter —
-                // and is hardcoded to descending ("higher score = better rank"),
-                // which matches SIVI's vulnerability convention but is the
-                // OPPOSITE of what SERI needs (lower score = more resilient =
-                // rank #1). Computing it directly here, ascending, is correct.
+                // BUGFIX (2026-09): this comment and the comparison below
+                // were correct under SERI's OLD (pre-v5.0.0) polarity.
+                // blomstra_rank_in_full_index() is still hardcoded to
+                // SIVI's descending convention, which is now actually the
+                // SAME direction SERI needs post-flip — but this function
+                // is left as an explicit, self-contained computation
+                // rather than switched to call the shared one, to avoid
+                // silently depending on another function's convention
+                // never changing again. $full_composites_sorted is now
+                // sorted descending (see above); rank increments for every
+                // full-coverage country that scores HIGHER than this
+                // hypothetical value.
                 $rank = 1;
                 foreach ( $full_composites_sorted as $full_score ) {
-                    if ( $hyp_composite > $full_score ) {
+                    if ( $full_score > $hyp_composite ) {
                         $rank++;
                     } else {
                         break;
@@ -1315,7 +1350,7 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
         '_meta' => array(
             'built_at'            => current_time( 'mysql' ),
             'status'              => 'valid',
-            'standard_version'    => 'BMS-1.1.0',
+            'standard_version'    => 'BMS-1.2.0',
             'methodology_version' => SERI_VERSION,
             'software_version'    => SERI_VERSION,
             'data_vintage'        => $weo_vintage,
@@ -1455,8 +1490,17 @@ add_action( SERI_DAILY_CRON_HOOK, function () {
     seri_fetch_fiscal( true, false );
     $result = seri_build_composite( false, 'cron' );
     if ( function_exists( 'blomstra_update_cron_status' ) ) {
-        $msg = isset( $result['total_countries'] ) ? $result['total_countries'] . ' countries scored.' : 'Build completed.';
-        blomstra_update_cron_status( 'seri_daily', 'success', $msg, $result['total_countries'] ?? 0 );
+        // BUGFIX (2026-09): this previously reported 'success'
+        // unconditionally, even when seri_build_composite() returned an
+        // error (e.g. no country list available) — the same "declares
+        // success regardless of outcome" bug already found and fixed in
+        // the reference-data layer's cron handlers.
+        if ( isset( $result['error'] ) ) {
+            blomstra_update_cron_status( 'seri_daily', 'error', 'Daily build failed: ' . $result['error'], 0 );
+        } else {
+            $msg = isset( $result['total_countries'] ) ? $result['total_countries'] . ' countries scored.' : 'Build completed.';
+            blomstra_update_cron_status( 'seri_daily', 'success', $msg, $result['total_countries'] ?? 0 );
+        }
     }
 } );
 
@@ -1478,8 +1522,14 @@ add_action( SERI_CRON_HOOK, function () {
     seri_fetch_fiscal( true, false );
     $result = seri_build_composite( false, 'cron' );
     if ( function_exists( 'blomstra_update_cron_status' ) ) {
-        $msg = isset( $result['total_countries'] ) ? $result['total_countries'] . ' countries scored.' : 'Build completed.';
-        blomstra_update_cron_status( 'seri', 'success', $msg, $result['total_countries'] ?? 0 );
+        // BUGFIX (2026-09): same fix as the daily cron above — check for
+        // an actual error instead of always declaring success.
+        if ( isset( $result['error'] ) ) {
+            blomstra_update_cron_status( 'seri', 'error', 'Weekly build failed: ' . $result['error'], 0 );
+        } else {
+            $msg = isset( $result['total_countries'] ) ? $result['total_countries'] . ' countries scored.' : 'Build completed.';
+            blomstra_update_cron_status( 'seri', 'success', $msg, $result['total_countries'] ?? 0 );
+        }
     }
 } );
 
@@ -1772,12 +1822,12 @@ function seri_render_admin_page() {
     echo '<div><strong style="display:block; font-size:13px; color:#666;">Composite Index</strong><span style="font-size:14px;">' . $composite_fresh . '</span></div>';
     echo '<div><strong style="display:block; font-size:13px; color:#666;">Build Lock</strong><span style="font-size:14px;">🔓 Free</span></div>';
     $last_run = null;
-    if ( $seri_status && isset( $seri_status['last_run'] ) ) {
-        $last_run = $seri_status['last_run'];
+    if ( $seri_status && isset( $seri_status['last_attempt'] ) ) {
+        $last_run = $seri_status['last_attempt'];
     }
-    if ( isset( $last_cron['seri_daily'] ) && isset( $last_cron['seri_daily']['last_run'] ) ) {
-        if ( ! $last_run || strtotime( $last_cron['seri_daily']['last_run'] ) > strtotime( $last_run ) ) {
-            $last_run = $last_cron['seri_daily']['last_run'];
+    if ( isset( $last_cron['seri_daily'] ) && isset( $last_cron['seri_daily']['last_attempt'] ) ) {
+        if ( ! $last_run || strtotime( $last_cron['seri_daily']['last_attempt'] ) > strtotime( $last_run ) ) {
+            $last_run = $last_cron['seri_daily']['last_attempt'];
         }
     }
     $last_fire_display = $last_run ? $last_run . ' ✅' : 'Never ❌';
@@ -1803,10 +1853,10 @@ function seri_render_admin_page() {
     echo '<div class="inside">';
     echo '<p>Automated weekly refresh: <strong>' . ( $next_cron ? 'ACTIVE — next run ' . esc_html( date_i18n( 'Y-m-d H:i', $next_cron ) ) . ' UTC' : 'NOT SCHEDULED' ) . '</strong></p>';
     if ( $seri_status ) {
-        echo '<p>Last weekly cron run: <strong>' . esc_html( $seri_status['status'] ) . '</strong> at ' . esc_html( $seri_status['last_run'] ) . ' — ' . esc_html( $seri_status['message'] ) . '</p>';
+        echo '<p>Last weekly cron run: <strong>' . esc_html( $seri_status['status'] ) . '</strong> at ' . esc_html( $seri_status['last_attempt'] ) . ' — ' . esc_html( $seri_status['message'] ) . '</p>';
     }
     if ( isset( $last_cron['seri_daily'] ) ) {
-        echo '<p>Last daily cron run: <strong>' . esc_html( $last_cron['seri_daily']['status'] ) . '</strong> at ' . esc_html( $last_cron['seri_daily']['last_run'] ) . ' — ' . esc_html( $last_cron['seri_daily']['message'] ) . '</p>';
+        echo '<p>Last daily cron run: <strong>' . esc_html( $last_cron['seri_daily']['status'] ) . '</strong> at ' . esc_html( $last_cron['seri_daily']['last_attempt'] ) . ' — ' . esc_html( $last_cron['seri_daily']['message'] ) . '</p>';
     }
     echo '</div></div>';
 
