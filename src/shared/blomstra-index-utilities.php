@@ -678,10 +678,28 @@ function blomstra_build_full_rank_display( $rank ) {
 }
 
 function blomstra_build_partial_rank_display( $ranks_by_injection ) {
-    $range_80_low  = $ranks_by_injection[10] ?? null;
-    $range_80_high = $ranks_by_injection[90] ?? null;
-    $theoretical_low  = $ranks_by_injection[0] ?? null;
-    $theoretical_high = $ranks_by_injection[100] ?? null;
+    // BUGFIX (2026-09): this used to assign injection point 10 to "low"
+    // and point 90 to "high" unconditionally, assuming point 10 always
+    // produces the smaller (better) rank number. That's backwards: a
+    // LOWER injected value always pushes the composite further from
+    // rank #1 (for every index on this engine, regardless of
+    // orientation — a lower composite is always a "worse position"
+    // rank number), so point 10 actually produces the BIGGER rank
+    // number and point 90 the smaller one. The old code then printed
+    // that unordered pair directly (e.g. "#136–164*" could become
+    // "#37–9*" — visibly backwards, a range where the first number is
+    // bigger than the second). Using min()/max() makes this correct
+    // regardless of which direction either point's rank actually comes
+    // out, for any index, present or future.
+    $r10  = $ranks_by_injection[10] ?? null;
+    $r90  = $ranks_by_injection[90] ?? null;
+    $r0   = $ranks_by_injection[0] ?? null;
+    $r100 = $ranks_by_injection[100] ?? null;
+
+    $range_80_low  = ( $r10 !== null && $r90 !== null ) ? min( $r10, $r90 ) : ( $r10 ?? $r90 );
+    $range_80_high = ( $r10 !== null && $r90 !== null ) ? max( $r10, $r90 ) : ( $r10 ?? $r90 );
+    $theoretical_low  = ( $r0 !== null && $r100 !== null ) ? min( $r0, $r100 ) : ( $r0 ?? $r100 );
+    $theoretical_high = ( $r0 !== null && $r100 !== null ) ? max( $r0, $r100 ) : ( $r0 ?? $r100 );
     $best_estimate = $ranks_by_injection[50] ?? null;
     return array(
         'is_definitive'    => false,
