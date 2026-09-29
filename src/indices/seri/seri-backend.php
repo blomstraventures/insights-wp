@@ -1,12 +1,21 @@
 /**
- * Sovereign Economic Resilience Index (SERI) — v4.2.1
+ * Sovereign Economic Resilience Index (SERI) — v5.1.0
  *
  * NOTE: This snippet depends on the "Shared Utilities" snippet being active
  *       (blomstra-index-utilities.php). Ensure it is loaded BEFORE this snippet.
  *
  * @package Blomstra\Insights\Indices\SERI
  * @since   3.5.5 (as GERI)
- * @version 4.2.1
+ * @version 5.1.0
+ *
+ * CHANGES (v5.1.0):
+ * - Historical backfill (per-year background jobs, status table, admin panel),
+ *   same architecture as SIVI. Historical years are scored by
+ *   seri_build_composite() itself (new $historical argument) - one scoring path.
+ * - DQI per pillar, composite DQI and vintage summary added to every country
+ *   (live and historical) via seri_compute_dqi_fields().
+ * - Live and historical snapshot rows now share seri_build_snapshot_rows()
+ *   (canonical flat shape via blomstra_build_flat_snapshot_row()).
  *
  * CHANGES (v4.2.1):
  * - Renamed to Sovereign Economic Resilience Index (SERI)
@@ -38,7 +47,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // management rule — it changes the meaning of every historical score,
 // not just the display. See seri_build_composite() for the per-indicator
 // detail.
-define( 'SERI_VERSION', '5.0.0' );
+define( 'SERI_VERSION', '5.1.0' );
 define( 'SERI_OPTION_KEY', 'seri_composite_index' );
 define( 'SERI_CRON_HOOK', 'seri_weekly_refresh' );
 define( 'SERI_DAILY_CRON_HOOK', 'seri_daily_cron' );
@@ -696,9 +705,14 @@ function seri_delete_scenario( $scenario_id ) {
 
 // ─── COMPOSITE BUILDER ─────────────────────────────────────────────
 
-function seri_build_composite( $force = false, $context = 'manual', $custom_weights = null, $custom_composite_weights = null ) {
+function seri_build_composite( $force = false, $context = 'manual', $custom_weights = null, $custom_composite_weights = null, $historical = null ) {
     // Detect if this is a scenario build
     $is_scenario = ( $custom_weights !== null || $custom_composite_weights !== null );
+    // Historical mode (v5.1.0): rows/sources for a past year are supplied by
+    // the caller (seri_build_historical_snapshot). Scoring below is the SAME
+    // code path as the live build; historical mode only swaps the input and
+    // stops before forward pressure, persistence and alerts.
+    $is_historical = is_array( $historical );
 
     if ( function_exists( 'set_time_limit' ) ) {
         @set_time_limit( 120 );
@@ -740,6 +754,12 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
             $fisc_data[ $iso3 ] ?? array()
         );
         // NO GDP→GNI fallback. GNI stands alone.
+    }
+
+    if ( $is_historical ) {
+        $rows         = $historical['rows'];
+        $all_sources  = $historical['sources'];
+        $fisc_sources = $historical['sources'];
     }
 
     // ─── GNI‑GDP DIVERGENCE ──────────────────────────────────────
@@ -1122,6 +1142,13 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
         );
     }
 
+    // DQI / vintage (v5.1.0): same helper for live and historical builds.
+    $dqi_ref_year = $is_historical ? (int) $historical['year'] : (int) current_time( 'Y' );
+    foreach ( $country_output as $iso3 => &$dq_out ) {
+        $dq_out = array_merge( $dq_out, seri_compute_dqi_fields( $rows[ $iso3 ] ?? array(), $dqi_ref_year, $composite_weights ) );
+    }
+    unset( $dq_out );
+
     // 7. Ranks (inverted for resilience: lower score = lower rank number)
     if ( function_exists( 'blomstra_build_full_rank_display' ) && function_exists( 'blomstra_build_partial_rank_display' ) ) {
         $full_countries = array();
@@ -1251,6 +1278,14 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
             }
         }
         unset( $out );
+    }
+
+    if ( $is_historical ) {
+        return array(
+            'countries' => $country_output,
+            'excluded'  => $excluded,
+            'weights'   => $composite_weights,
+        );
     }
 
     // 8. Forward Pressure
@@ -1384,20 +1419,8 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
         update_option( SERI_OPTION_KEY, $output, false );
         delete_option( $staging_key );
 
-        if ( function_exists( 'blomstra_index_snapshot_save' ) ) {
-            $snap = array();
-            foreach ( $country_output as $iso3 => $data ) {
-                $snap[ $iso3 ] = array(
-                    'composite_score' => $data['seri_structural'] ?? null,
-                    'rank' => $data['rank_display']['best_estimate'] ?? null,
-                    'coverage_type' => $data['coverage'] ?? 'full',
-                    'governance' => $data['pillars']['governance']['score'] ?? null,
-                    'macro'      => $data['pillars']['macro']['score'] ?? null,
-                    'external'   => $data['pillars']['external']['score'] ?? null,
-                    'fiscal'     => $data['pillars']['fiscal']['score'] ?? null,
-                );
-            }
-            blomstra_index_snapshot_save( 'seri', $snap );
+        if ( function_exists( 'blomstra_index_snapshot_save' ) && function_exists( 'blomstra_build_flat_snapshot_row' ) ) {
+            blomstra_index_snapshot_save( 'seri', seri_build_snapshot_rows( $country_output ) );
         }
     }
 
@@ -1696,6 +1719,9 @@ function seri_render_admin_page() {
         echo '<div class="notice notice-warning"><p>🗑️ Scenario <strong>' . esc_html( $scenario_id ) . '</strong> deleted.</p></div>';
     }
 
+    // ── Historical backfill actions (v5.1.0) ──────────────────────
+    seri_backfill_handle_actions();
+
     $existing = get_option( SERI_OPTION_KEY, null );
     $next_cron = wp_next_scheduled( SERI_CRON_HOOK );
     $last_cron = get_option( 'blomstra_cron_status', array() );
@@ -1927,6 +1953,9 @@ function seri_render_admin_page() {
     echo '<strong>Flush ALL Caches</strong> — deletes all pillar and composite data (destructive).</p>';
     echo '</div></div>';
 
+    // ─── HISTORICAL BACKFILL PANEL (v5.1.0) ───────────────────────
+    seri_render_backfill_box();
+
     // ─── SENSITIVITY TESTING ──────────────────────────────────────
     $scenarios = seri_list_scenarios();
     $baseline = get_option( SERI_OPTION_KEY );
@@ -2141,4 +2170,696 @@ function seri_render_admin_page() {
     }
 
     echo '</div>';
+}
+
+// ============================================================================
+// HISTORICAL BACKFILL (SERI v5.1.0)
+//
+// Reuses the SAME reference-data layer SIVI's backfill uses
+// (global-reference-data.php) — nothing in that file is touched or
+// duplicated. Specifically:
+//   - WB indicators: blomstra_fetch_wb_historical_batch() — the existing,
+//     already-cached range fetcher. One call per indicator per country
+//     range; cached as a WordPress transient (1 week), so a later
+//     backfill year reusing the same indicator hits the cache instead of
+//     calling the World Bank API again.
+//   - IMF indicators (fiscal pillar): the IMF WEO datamapper endpoint
+//     returns a country's FULL time series in one response regardless of
+//     year requested, but every existing helper in this codebase narrows
+//     that response down to a single year before returning it. Since
+//     nothing shared returns the full series, seri_hist_imf_series()
+//     below fetches it once (2 codes total: GGXWDG_NGDP, GGXCNL_NGDP) and
+//     caches it — this is the one genuinely new fetch helper, kept
+//     minimal on purpose.
+//   - Scoring: historical years run through seri_build_composite() itself
+//     (new $historical argument) — the exact same pillar math, percentile
+//     ranking, coverage rules and ranking logic as the live build. Only
+//     the input rows differ.
+//   - Snapshot shape: live and historical rows both go through
+//     seri_build_snapshot_rows(), using the same
+//     blomstra_build_flat_snapshot_row() helper SIVI uses, so the two
+//     can never diverge in shape the way SIVI's did before v3.3.0.
+//
+// A year is never silently built from missing data: if a required WB or
+// IMF series cannot be fetched, the year fails with a message instead of
+// scoring on a hole.
+// ============================================================================
+
+define( 'SERI_BACKFILL_MIN_YEAR', 2002 );          // first year of annual (non-biennial) WGI releases
+define( 'SERI_HIST_LOOKBACK_YEARS', 5 );           // how far back a point-in-time value may be carried for a given year
+define( 'SERI_HIST_VOL_WINDOW_YEARS', 5 );         // trailing window used for volatility / debt-trajectory CAGR
+define( 'SERI_HIST_PARTIAL_THRESHOLD', 100 );      // fewer scored countries than this = status "partial"
+define( 'SERI_BACKFILL_YEAR_HOOK', 'seri_backfill_year_cron' );
+define( 'SERI_BACKFILL_LOCK_KEY', 'seri_backfill_lock' );
+define( 'SERI_BACKFILL_STATUS_KEY', 'seri_backfill_status' );
+
+// ─── WB indicator codes SERI needs, mapped to internal field names ───────
+// (source: null = WDI, 3 = WGI — same convention as BLOMSTRA_WB_INDICATORS)
+
+function seri_hist_wb_code_map() {
+    return array(
+        'rule_of_law'           => array( 'GOV_WGI_RL.SC', 3 ),
+        'control_of_corruption' => array( 'GOV_WGI_CC.SC', 3 ),
+        'political_stability'   => array( 'GOV_WGI_PV.SC', 3 ),
+        'gni_growth'            => array( 'NY.GNP.MKTP.KD.ZG', null ),
+        'gni_growth_percap'     => array( 'NY.GNP.PCAP.KD.ZG', null ),
+        'inflation'             => array( 'FP.CPI.TOTL.ZG', null ),
+        'unemployment'          => array( 'SL.UEM.TOTL.ZS', null ),
+        'gdp_growth'            => array( 'NY.GDP.MKTP.KD.ZG', null ),
+        'reserve_months'        => array( 'FI.RES.TOTL.MO', null ),
+        'external_debt'         => array( 'DT.DOD.DECT.GN.ZS', null ),
+        'current_account'       => array( 'BN.CAB.XOKA.GD.ZS', null ),
+        'gov_debt_wb'           => array( 'GC.DOD.TOTL.GD.ZS', null ),
+        'gov_balance_wb'        => array( 'GC.NLD.TOTL.GD.ZS', null ),
+    );
+}
+
+/**
+ * Full time series for one WB indicator: iso3 => [ year => value ].
+ * Calls the EXISTING shared range fetcher from global-reference-data.php
+ * (blomstra_fetch_wb_historical_batch) with force=false, so it reads that
+ * function's own transient cache on repeat calls instead of re-fetching.
+ * One request per code covers the whole usable range, reused by every
+ * backfill year in this run and by any later run within the cache TTL.
+ */
+function seri_hist_wb_series( $code, $source = null ) {
+    static $mem = array();
+    $mem_key = $code . '|' . (string) $source;
+    if ( isset( $mem[ $mem_key ] ) ) {
+        return $mem[ $mem_key ];
+    }
+    if ( ! function_exists( 'blomstra_fetch_wb_historical_batch' ) ) {
+        $mem[ $mem_key ] = array();
+        return array();
+    }
+    $end   = (int) current_time( 'Y' );
+    $start = SERI_BACKFILL_MIN_YEAR - SERI_HIST_LOOKBACK_YEARS - SERI_HIST_VOL_WINDOW_YEARS;
+    $data  = blomstra_fetch_wb_historical_batch( $code, $start, $end, $source, false );
+    $mem[ $mem_key ] = is_array( $data ) ? $data : array();
+    return $mem[ $mem_key ];
+}
+
+/**
+ * Full time series for one IMF WEO indicator: iso3 => [ year => value ].
+ * No existing shared function returns a full multi-year series (every one
+ * already narrows the datamapper response to a single year), so this
+ * fetches the endpoint once per code and caches it — the one new fetch
+ * helper this feature needs, scoped to the 2 fiscal codes SERI uses.
+ */
+function seri_hist_imf_series( $code ) {
+    static $mem = array();
+    if ( isset( $mem[ $code ] ) ) {
+        return $mem[ $code ];
+    }
+    $cache_key = 'seri_hist_imf_full_' . $code;
+    $cached    = get_transient( $cache_key );
+    if ( is_array( $cached ) ) {
+        $mem[ $code ] = $cached;
+        return $cached;
+    }
+    $out = array();
+    $url = 'https://www.imf.org/external/datamapper/api/v1/' . $code;
+    for ( $attempt = 1; $attempt <= 3; $attempt++ ) {
+        $response = wp_remote_get( $url, array( 'timeout' => 60, 'user-agent' => 'SERI-Direct/' . SERI_VERSION ) );
+        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
+            $body = json_decode( wp_remote_retrieve_body( $response ), true );
+            $map  = defined( 'BLOMSTRA_IMF_TO_ISO3_MAP' ) ? BLOMSTRA_IMF_TO_ISO3_MAP : array();
+            if ( isset( $body['values'][ $code ] ) && is_array( $body['values'][ $code ] ) ) {
+                foreach ( $body['values'][ $code ] as $imf_code => $years ) {
+                    $iso3 = $map[ $imf_code ] ?? $imf_code;
+                    if ( ! is_array( $years ) ) {
+                        continue;
+                    }
+                    foreach ( $years as $y => $v ) {
+                        if ( is_numeric( $v ) ) {
+                            $out[ $iso3 ][ (int) $y ] = (float) $v;
+                        }
+                    }
+                }
+            }
+        }
+        if ( ! empty( $out ) ) {
+            break;
+        }
+        if ( $attempt < 3 ) {
+            sleep( 3 * $attempt );
+        }
+    }
+    if ( ! empty( $out ) ) {
+        set_transient( $cache_key, $out, WEEK_IN_SECONDS );
+    }
+    $mem[ $code ] = $out;
+    return $out;
+}
+
+/** Most recent value at or before $year, no older than $lookback years. */
+function seri_hist_latest( $series, $iso3, $year, $lookback ) {
+    if ( empty( $series[ $iso3 ] ) || ! is_array( $series[ $iso3 ] ) ) {
+        return null;
+    }
+    for ( $y = $year; $y >= $year - $lookback; $y-- ) {
+        if ( isset( $series[ $iso3 ][ $y ] ) && is_numeric( $series[ $iso3 ][ $y ] ) ) {
+            return array( 'value' => (float) $series[ $iso3 ][ $y ], 'year' => $y );
+        }
+    }
+    return null;
+}
+
+/** Year-sorted slice of one country's series within [$from, $to]. */
+function seri_hist_window( $country_series, $from, $to ) {
+    $out = array();
+    if ( ! is_array( $country_series ) ) {
+        return $out;
+    }
+    foreach ( $country_series as $y => $v ) {
+        if ( (int) $y >= $from && (int) $y <= $to && is_numeric( $v ) ) {
+            $out[ (int) $y ] = (float) $v;
+        }
+    }
+    ksort( $out, SORT_NUMERIC );
+    return $out;
+}
+
+// ─── Historical data assembly ─────────────────────────────────────────────
+
+/**
+ * Build the merged per-country raw rows (and source map) for one year, in
+ * the exact field shape seri_build_composite() expects from the live
+ * fetchers (seri_fetch_governance / macro / external / fiscal). If a field
+ * name in a live fetcher changes, change it here too.
+ *
+ * @return array  array( 'rows' => ..., 'sources' => ... ) or array( 'error' => string )
+ */
+function seri_hist_build_rows( $year, $countries ) {
+    $year = (int) $year;
+    $lb   = SERI_HIST_LOOKBACK_YEARS;
+
+    $wb       = array();
+    $missing  = array();
+    foreach ( seri_hist_wb_code_map() as $field => $spec ) {
+        list( $code, $source ) = $spec;
+        $series = seri_hist_wb_series( $code, $source );
+        if ( empty( $series ) ) {
+            $missing[] = $code;
+        }
+        $wb[ $field ] = $series;
+    }
+
+    $imf_debt    = seri_hist_imf_series( 'GGXWDG_NGDP' );
+    $imf_balance = seri_hist_imf_series( 'GGXCNL_NGDP' );
+    if ( empty( $imf_debt ) ) {
+        $missing[] = 'IMF:GGXWDG_NGDP';
+    }
+    if ( empty( $imf_balance ) ) {
+        $missing[] = 'IMF:GGXCNL_NGDP';
+    }
+
+    if ( ! empty( $missing ) ) {
+        return array( 'error' => 'Could not fetch: ' . implode( ', ', $missing ) . '. Check network/API access and retry.' );
+    }
+
+    $rows    = array();
+    $sources = array();
+
+    foreach ( array_keys( $countries ) as $iso3 ) {
+        $row = array();
+
+        // Governance (WGI)
+        foreach ( array( 'rule_of_law', 'control_of_corruption', 'political_stability' ) as $name ) {
+            $hit = seri_hist_latest( $wb[ $name ], $iso3, $year, $lb );
+            if ( $hit ) {
+                $row[ $name ]             = $hit['value'];
+                $row[ $name . '_year' ]   = $hit['year'];
+                $row[ $name . '_source' ] = 'WGI';
+                blomstra_track_source( $sources, $iso3, $name, 'WGI', 'composite', $hit['year'] );
+            }
+        }
+
+        // Macro: GNI growth (aggregate primary, per-capita fallback — as live)
+        $hit = seri_hist_latest( $wb['gni_growth'], $iso3, $year, $lb );
+        if ( $hit ) {
+            $row['gni_growth']        = $hit['value'];
+            $row['gni_growth_year']   = $hit['year'];
+            $row['gni_growth_source'] = 'WB_WDI';
+            blomstra_track_source( $sources, $iso3, 'gni_growth', 'WB_WDI', 'national', $hit['year'] );
+        } else {
+            $hit2 = seri_hist_latest( $wb['gni_growth_percap'], $iso3, $year, $lb );
+            if ( $hit2 ) {
+                $row['gni_growth']        = $hit2['value'];
+                $row['gni_growth_year']   = $hit2['year'];
+                $row['gni_growth_source'] = 'WB_WDI_per_capita (fallback)';
+                blomstra_track_source( $sources, $iso3, 'gni_growth', 'WB_WDI_per_capita', 'national', $hit2['year'] );
+            }
+        }
+
+        foreach ( array( 'inflation', 'unemployment', 'gdp_growth' ) as $name ) {
+            $hit = seri_hist_latest( $wb[ $name ], $iso3, $year, $lb );
+            if ( $hit ) {
+                $row[ $name ]             = $hit['value'];
+                $row[ $name . '_year' ]   = $hit['year'];
+                $row[ $name . '_source' ] = 'WB_WDI';
+                blomstra_track_source( $sources, $iso3, $name, 'WB_WDI', 'national', $hit['year'] );
+            }
+        }
+
+        // Macro: derived volatilities over a trailing window ending at $year
+        $vol_map = array( 'gdp_volatility' => 'gdp_growth', 'inflation_volatility' => 'inflation' );
+        foreach ( $vol_map as $vname => $src_field ) {
+            $win  = seri_hist_window( $wb[ $src_field ][ $iso3 ] ?? array(), $year - SERI_HIST_VOL_WINDOW_YEARS, $year );
+            $vals = array_values( $win );
+            if ( count( $vals ) >= 4 ) {
+                $row[ $vname ]                   = blomstra_compute_stddev( $vals, true );
+                $row[ $vname . '_window' ]       = SERI_HIST_VOL_WINDOW_YEARS . ' years';
+                $row[ $vname . '_observations' ] = count( $vals );
+                $row[ $vname . '_years' ]        = implode( ',', array_keys( $win ) );
+                blomstra_track_source( $sources, $iso3, $vname, 'WB_WDI_derived', 'national' );
+            } else {
+                $row[ $vname ] = null;
+            }
+        }
+
+        // External
+        foreach ( array( 'reserve_months', 'external_debt', 'current_account' ) as $name ) {
+            $hit = seri_hist_latest( $wb[ $name ], $iso3, $year, $lb );
+            if ( $hit ) {
+                $row[ $name ]             = $hit['value'];
+                $row[ $name . '_year' ]   = $hit['year'];
+                $row[ $name . '_source' ] = 'WB_WDI';
+                blomstra_track_source( $sources, $iso3, $name, 'WB_WDI', 'national', $hit['year'] );
+            }
+        }
+
+        // Fiscal: IMF WEO primary (general government), WB fallback (central)
+        $hit = seri_hist_latest( $imf_debt, $iso3, $year, $lb );
+        if ( $hit ) {
+            $row['gov_debt']      = $hit['value'];
+            $row['gov_debt_year'] = $hit['year'];
+            blomstra_track_source( $sources, $iso3, 'gov_debt', 'IMF_WEO', 'general_gov', $hit['year'] );
+        } else {
+            $hit = seri_hist_latest( $wb['gov_debt_wb'], $iso3, $year, $lb );
+            if ( $hit ) {
+                $row['gov_debt']      = $hit['value'];
+                $row['gov_debt_year'] = $hit['year'];
+                blomstra_track_source( $sources, $iso3, 'gov_debt', 'WB_WDI', 'central_gov', $hit['year'] );
+            }
+        }
+        $hit = seri_hist_latest( $imf_balance, $iso3, $year, $lb );
+        if ( $hit ) {
+            $row['gov_balance']      = $hit['value'];
+            $row['gov_balance_year'] = $hit['year'];
+            blomstra_track_source( $sources, $iso3, 'gov_balance', 'IMF_WEO', 'general_gov', $hit['year'] );
+        } else {
+            $hit = seri_hist_latest( $wb['gov_balance_wb'], $iso3, $year, $lb );
+            if ( $hit ) {
+                $row['gov_balance']      = $hit['value'];
+                $row['gov_balance_year'] = $hit['year'];
+                blomstra_track_source( $sources, $iso3, 'gov_balance', 'WB_WDI', 'central_gov', $hit['year'] );
+            }
+        }
+
+        // Fiscal: debt trajectory (CAGR of central-gov debt over the trailing window)
+        $debt_win = seri_hist_window( $wb['gov_debt_wb'][ $iso3 ] ?? array(), $year - SERI_HIST_VOL_WINDOW_YEARS, $year );
+        $ts       = blomstra_sanitize_timeseries( $debt_win, 4, 2 );
+        if ( ! empty( $ts ) ) {
+            $cagr = blomstra_compute_cagr( $ts );
+            if ( $cagr !== null ) {
+                $year_keys = array_keys( $ts );
+                $row['debt_trajectory']              = $cagr;
+                $row['debt_trajectory_oldest_year']  = $year_keys[0];
+                $row['debt_trajectory_newest_year']  = $year_keys[ count( $year_keys ) - 1 ];
+                $row['debt_trajectory_span']         = end( $year_keys ) - $year_keys[0];
+                $row['debt_trajectory_observations'] = count( $year_keys );
+                $row['debt_trajectory_quality']      = count( $year_keys ) >= 4 ? 'good' : 'limited';
+                blomstra_track_source( $sources, $iso3, 'debt_trajectory', 'WB_WDI_derived', 'central_gov' );
+            } else {
+                $row['debt_trajectory']         = null;
+                $row['debt_trajectory_quality'] = 'invalid';
+            }
+        } else {
+            $row['debt_trajectory']         = null;
+            $row['debt_trajectory_quality'] = 'insufficient_data';
+        }
+
+        $rows[ $iso3 ] = $row;
+    }
+
+    return array( 'rows' => $rows, 'sources' => $sources );
+}
+
+// ─── DQI / vintage (shared by live and historical builds) ─────────────────
+//
+// SERI has never disclosed data freshness the way SIVI's DQI does. Adding
+// it only to historical rows would leave the live seri_composite_index and
+// the historical snapshot rows in two different shapes — exactly the bug
+// class SIVI hit before its v3.3.0 fix (see the shared changelog). So this
+// is computed the same way for both live and historical builds.
+
+function seri_get_dqi_max_lags() {
+    // Max acceptable data age in years per pillar before DQI reaches 0.
+    return array(
+        'governance' => 3,
+        'macro'      => 3,
+        'external'   => 4,
+        'fiscal'     => 3,
+    );
+}
+
+/**
+ * Representative data year for a pillar = the OLDEST contributing
+ * indicator year (conservative). Derived indicators (volatility, debt
+ * trajectory) count at their newest observation year.
+ */
+function seri_pillar_data_year( $row, $pillar ) {
+    $years  = array();
+    $direct = array(
+        'governance' => array( 'rule_of_law_year', 'control_of_corruption_year', 'political_stability_year' ),
+        'macro'      => array( 'gni_growth_year', 'inflation_year', 'unemployment_year' ),
+        'external'   => array( 'reserve_months_year', 'external_debt_year', 'current_account_year' ),
+        'fiscal'     => array( 'gov_debt_year', 'gov_balance_year', 'debt_trajectory_newest_year' ),
+    );
+    foreach ( $direct[ $pillar ] ?? array() as $k ) {
+        if ( isset( $row[ $k ] ) && is_numeric( $row[ $k ] ) && (int) $row[ $k ] > 0 ) {
+            $years[] = (int) $row[ $k ];
+        }
+    }
+    if ( $pillar === 'macro' ) {
+        foreach ( array( 'gdp_volatility', 'inflation_volatility' ) as $v ) {
+            if ( isset( $row[ $v ] ) && is_numeric( $row[ $v ] ) && ! empty( $row[ $v . '_years' ] ) ) {
+                $ys = array_map( 'intval', explode( ',', $row[ $v . '_years' ] ) );
+                $years[] = max( $ys );
+            }
+        }
+    }
+    return empty( $years ) ? null : min( $years );
+}
+
+function seri_compute_dqi_fields( $row, $ref_year, $composite_weights ) {
+    $out   = array();
+    $pd    = array();
+    $parts = array();
+    foreach ( seri_get_dqi_max_lags() as $p => $lag ) {
+        $y                        = seri_pillar_data_year( $row, $p );
+        $dqi                      = blomstra_compute_dqi( $y, $ref_year, $lag );
+        $out[ 'data_year_' . $p ] = $y;
+        $out[ 'dqi_' . $p ]       = $dqi;
+        $pd[] = array( 'dqi' => $dqi, 'weight' => $composite_weights[ $p ] ?? 25 );
+        if ( $y !== null ) {
+            $parts[] = ucfirst( $p ) . ': ' . $y;
+        }
+    }
+    $out['composite_dqi']   = blomstra_compute_composite_dqi( $pd );
+    $out['vintage_summary'] = ! empty( $parts ) ? implode( ', ', $parts ) : 'No data';
+    return $out;
+}
+
+// ─── Canonical snapshot rows (live AND historical) ────────────────────────
+
+function seri_build_snapshot_rows( $country_output ) {
+    $snap = array();
+    foreach ( $country_output as $iso3 => $data ) {
+        $scores = array();
+        $dqi    = array();
+        foreach ( array( 'governance', 'macro', 'external', 'fiscal' ) as $p ) {
+            $scores[ $p ] = $data['pillars'][ $p ]['score'] ?? null;
+            $dqi[ $p ]    = $data[ 'dqi_' . $p ] ?? null;
+        }
+        $snap[ $iso3 ] = blomstra_build_flat_snapshot_row(
+            $data['seri_structural'] ?? null,
+            $data['rank_display']['best_estimate'] ?? null,
+            $data['coverage'] ?? 'full',
+            $scores,
+            $dqi,
+            $data['composite_dqi'] ?? null,
+            $data['vintage_summary'] ?? null
+        );
+    }
+    return $snap;
+}
+
+// ─── One historical year ──────────────────────────────────────────────────
+
+function seri_build_historical_snapshot( $year ) {
+    if ( ! function_exists( 'blomstra_index_snapshot_save' ) || ! function_exists( 'blomstra_build_flat_snapshot_row' ) ) {
+        return array( 'success' => false, 'countries' => 0, 'error' => 'Shared utilities not active (blomstra_index_snapshot_save / blomstra_build_flat_snapshot_row missing).' );
+    }
+    if ( function_exists( 'set_time_limit' ) ) {
+        @set_time_limit( 300 );
+    }
+    $countries = function_exists( 'blomstra_get_global_country_list' ) ? blomstra_get_global_country_list() : array();
+    if ( empty( $countries ) ) {
+        return array( 'success' => false, 'countries' => 0, 'error' => 'No country list available.' );
+    }
+
+    $data = seri_hist_build_rows( $year, $countries );
+    if ( isset( $data['error'] ) ) {
+        return array( 'success' => false, 'countries' => 0, 'error' => $data['error'] );
+    }
+
+    $result = seri_build_composite( false, 'historical', null, null, array(
+        'year'    => (int) $year,
+        'rows'    => $data['rows'],
+        'sources' => $data['sources'],
+    ) );
+    if ( isset( $result['error'] ) ) {
+        return array( 'success' => false, 'countries' => 0, 'error' => $result['error'] );
+    }
+    if ( empty( $result['countries'] ) ) {
+        return array( 'success' => false, 'countries' => 0, 'error' => 'Scoring produced zero countries for ' . (int) $year . '.' );
+    }
+
+    $saved = blomstra_index_snapshot_save( 'seri', seri_build_snapshot_rows( $result['countries'] ), (int) $year . '-01' );
+    return array(
+        'success'   => $saved > 0,
+        'countries' => (int) $saved,
+        'excluded'  => count( $result['excluded'] ?? array() ),
+        'error'     => $saved > 0 ? null : 'Snapshot save wrote 0 rows.',
+    );
+}
+
+// ─── Status tracking ──────────────────────────────────────────────────────
+
+function seri_get_backfill_range() {
+    $range = blomstra_get_index_backfill_range( 'seri' );
+    $start = max( (int) $range['start'], SERI_BACKFILL_MIN_YEAR );
+    $end   = max( (int) $range['end'], $start );
+    return array( 'start' => $start, 'end' => $end );
+}
+
+function seri_get_backfill_status() {
+    $range   = seri_get_backfill_range();
+    $default = array();
+    for ( $y = $range['start']; $y <= $range['end']; $y++ ) {
+        $default[ $y ] = array( 'status' => 'not_started', 'countries' => 0, 'last_attempt' => null, 'error' => null );
+    }
+    $status = get_option( SERI_BACKFILL_STATUS_KEY, $default );
+    if ( ! is_array( $status ) ) {
+        $status = $default;
+    }
+    foreach ( $default as $y => $val ) {
+        if ( ! isset( $status[ $y ] ) ) {
+            $status[ $y ] = $val;
+        }
+    }
+    return $status;
+}
+
+function seri_update_backfill_status( $year, $status, $countries = null, $error = null ) {
+    $current = seri_get_backfill_status();
+    $current[ $year ] = array(
+        'status'       => $status,
+        'countries'    => $countries !== null ? (int) $countries : ( $current[ $year ]['countries'] ?? 0 ),
+        'last_attempt' => current_time( 'mysql' ),
+        'error'        => $error,
+    );
+    update_option( SERI_BACKFILL_STATUS_KEY, $current, false );
+}
+
+function seri_backfill_check_completion() {
+    $status   = seri_get_backfill_status();
+    $range    = seri_get_backfill_range();
+    $terminal = array( 'success', 'partial', 'failed' );
+    for ( $y = $range['start']; $y <= $range['end']; $y++ ) {
+        if ( ! in_array( $status[ $y ]['status'] ?? 'not_started', $terminal, true ) ) {
+            return;
+        }
+    }
+    delete_transient( SERI_BACKFILL_LOCK_KEY );
+    error_log( 'SERI backfill completed - lock cleared.' );
+}
+
+/**
+ * Run + record one year. Used by the cron job and by the admin Retry button.
+ */
+function seri_run_backfill_year( $year ) {
+    $year = (int) $year;
+    seri_update_backfill_status( $year, 'running', null, null );
+
+    $done = false;
+    register_shutdown_function( function () use ( $year, &$done ) {
+        if ( ! $done ) {
+            seri_update_backfill_status( $year, 'failed', 0, 'Job terminated before completing (likely a PHP time or memory limit).' );
+        }
+    } );
+
+    $result = seri_build_historical_snapshot( $year );
+    if ( $result['success'] ) {
+        if ( $result['countries'] < SERI_HIST_PARTIAL_THRESHOLD ) {
+            seri_update_backfill_status( $year, 'partial', $result['countries'], 'Only ' . $result['countries'] . ' countries scored (expected at least ' . SERI_HIST_PARTIAL_THRESHOLD . '). Source coverage for this year is thin.' );
+        } else {
+            seri_update_backfill_status( $year, 'success', $result['countries'], null );
+        }
+    } else {
+        seri_update_backfill_status( $year, 'failed', 0, $result['error'] ?? 'Unknown error' );
+    }
+    $done = true;
+    return $result;
+}
+
+// ─── Cron callback ──────────────────────────────────────────────────────
+
+add_action( SERI_BACKFILL_YEAR_HOOK, 'seri_backfill_year_cron_callback', 10, 1 );
+function seri_backfill_year_cron_callback( $year ) {
+    if ( ! get_transient( SERI_BACKFILL_LOCK_KEY ) ) {
+        error_log( "SERI backfill cron for $year called but lock missing - skipping." );
+        return;
+    }
+    seri_run_backfill_year( (int) $year );
+    seri_backfill_check_completion();
+}
+
+// ─── Admin: actions (called at the top of seri_render_admin_page) ─────────
+
+function seri_backfill_handle_actions() {
+    global $wpdb;
+
+    if ( isset( $_POST['seri_save_backfill_range'] ) && check_admin_referer( 'seri_backfill_range_action', 'seri_backfill_range_nonce' ) ) {
+        $start = (int) $_POST['seri_backfill_start'];
+        $end   = (int) $_POST['seri_backfill_end'];
+        if ( $start >= SERI_BACKFILL_MIN_YEAR && $start <= $end && $end <= (int) current_time( 'Y' ) ) {
+            update_option( 'seri_backfill_range_start', $start, false );
+            update_option( 'seri_backfill_range_end', $end, false );
+            echo '<div class="notice notice-success"><p>✅ SERI backfill range set to ' . $start . '–' . $end . '.</p></div>';
+        } else {
+            echo '<div class="notice notice-error"><p>❌ Invalid range. Start must be ≤ End, at least ' . SERI_BACKFILL_MIN_YEAR . ', and End cannot be in the future.</p></div>';
+        }
+    }
+
+    if ( isset( $_POST['seri_backfill_all'] ) && check_admin_referer( 'seri_backfill_all_action', 'seri_backfill_all_nonce' ) ) {
+        if ( get_transient( SERI_BACKFILL_LOCK_KEY ) !== false ) {
+            echo '<div class="notice notice-warning"><p>⚠️ Backfill is already running. Use "Cancel and clear lock" if it is stuck.</p></div>';
+        } else {
+            set_transient( SERI_BACKFILL_LOCK_KEY, time(), 2 * HOUR_IN_SECONDS );
+            $range = seri_get_backfill_range();
+            $i = 0;
+            for ( $y = $range['start']; $y <= $range['end']; $y++, $i++ ) {
+                wp_schedule_single_event( time() + 30 + ( $i * 90 ), SERI_BACKFILL_YEAR_HOOK, array( $y ) );
+                seri_update_backfill_status( $y, 'scheduled', 0, null );
+            }
+            echo '<div class="notice notice-success"><p>✅ Backfill scheduled for ' . $range['start'] . '–' . $range['end'] . ': one background job per year (90-second stagger). Refresh this page to follow progress.</p></div>';
+        }
+    }
+
+    if ( isset( $_POST['seri_backfill_year'] ) && check_admin_referer( 'seri_backfill_year_action', 'seri_backfill_year_nonce' ) ) {
+        $year  = (int) $_POST['seri_backfill_year'];
+        $range = seri_get_backfill_range();
+        if ( $year < $range['start'] || $year > $range['end'] ) {
+            echo '<div class="notice notice-error"><p>Invalid year. Must be between ' . $range['start'] . ' and ' . $range['end'] . '.</p></div>';
+        } else {
+            $result = seri_run_backfill_year( $year );
+            if ( $result['success'] ) {
+                echo '<div class="notice notice-success"><p>✅ Backfill for ' . $year . ' completed – ' . (int) $result['countries'] . ' countries saved.</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>❌ Backfill for ' . $year . ' failed: ' . esc_html( $result['error'] ) . '</p></div>';
+            }
+        }
+    }
+
+    if ( isset( $_POST['seri_backfill_cancel'] ) && check_admin_referer( 'seri_backfill_cancel_action', 'seri_backfill_cancel_nonce' ) ) {
+        $range = seri_get_backfill_range();
+        for ( $y = $range['start']; $y <= $range['end']; $y++ ) {
+            wp_clear_scheduled_hook( SERI_BACKFILL_YEAR_HOOK, array( $y ) );
+        }
+        delete_transient( SERI_BACKFILL_LOCK_KEY );
+        $status = seri_get_backfill_status();
+        foreach ( $status as $y => $st ) {
+            if ( is_array( $st ) && in_array( $st['status'] ?? '', array( 'scheduled', 'running' ), true ) ) {
+                seri_update_backfill_status( (int) $y, 'not_started', 0, 'Cancelled by admin.' );
+            }
+        }
+        echo '<div class="notice notice-warning"><p>⏹️ Pending backfill jobs cancelled and lock cleared.</p></div>';
+    }
+
+    if ( isset( $_POST['seri_purge_history'] ) && check_admin_referer( 'seri_purge_history_action', 'seri_purge_history_nonce' ) ) {
+        $deleted = $wpdb->delete( $wpdb->prefix . 'blomstra_index_history', array( 'index_slug' => 'seri' ), array( '%s' ) );
+        delete_option( SERI_BACKFILL_STATUS_KEY );
+        echo '<div class="notice notice-warning"><p>🗑️ Deleted ' . (int) $deleted . ' SERI snapshot rows and reset backfill status. Rebuild the index, then run the backfill.</p></div>';
+    }
+}
+
+// ─── Admin: panel (called inside seri_render_admin_page) ──────────────────
+
+function seri_render_backfill_box() {
+    $range      = seri_get_backfill_range();
+    $status     = seri_get_backfill_status();
+    $is_running = ( get_transient( SERI_BACKFILL_LOCK_KEY ) !== false );
+
+    echo '<div class="postbox" style="border-left:4px solid #9b51e0; background:#fff;">';
+    echo '<div class="postbox-header"><h2 class="hndle"><span class="dashicons dashicons-backup"></span> 📅 Historical Backfill</h2></div>';
+    echo '<div class="inside">';
+    echo '<p style="color:#666;">Builds one snapshot per year using the <strong>current</strong> SERI methodology (v' . esc_html( SERI_VERSION ) . '), from the same World Bank / IMF reference data used by the rest of this plugin. Values are the latest observation at or before each year (World Bank/IMF revise their series, so this is a reconstruction using today\'s published numbers, not what SERI would have shown at the time). Data older than ' . (int) SERI_HIST_LOOKBACK_YEARS . ' years is not carried forward.</p>';
+
+    echo '<form method="post" style="margin-bottom:12px;">';
+    wp_nonce_field( 'seri_backfill_range_action', 'seri_backfill_range_nonce' );
+    echo '<div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">';
+    echo '<div><label>Start Year: <input type="number" name="seri_backfill_start" value="' . esc_attr( $range['start'] ) . '" min="' . SERI_BACKFILL_MIN_YEAR . '" max="2100"></label></div>';
+    echo '<div><label>End Year: <input type="number" name="seri_backfill_end" value="' . esc_attr( $range['end'] ) . '" min="' . SERI_BACKFILL_MIN_YEAR . '" max="2100"></label></div>';
+    echo '<div><button type="submit" name="seri_save_backfill_range" class="button button-secondary">💾 Save Range</button></div>';
+    echo '</div></form>';
+
+    $colors = array( 'success' => '#2e7d32', 'partial' => '#f0ad4e', 'failed' => '#d63638', 'scheduled' => '#2271b1', 'running' => '#2271b1' );
+    echo '<table class="widefat striped"><thead><tr><th>Year</th><th>Status</th><th>Countries</th><th>Last Attempt</th><th>Message</th><th>Action</th></tr></thead><tbody>';
+    for ( $y = $range['start']; $y <= $range['end']; $y++ ) {
+        $st    = $status[ $y ];
+        $color = $colors[ $st['status'] ] ?? '#999';
+        echo '<tr>';
+        echo '<td><strong>' . esc_html( $y ) . '</strong></td>';
+        echo '<td style="color:' . $color . ';">' . esc_html( ucfirst( str_replace( '_', ' ', $st['status'] ) ) ) . '</td>';
+        echo '<td>' . esc_html( $st['countries'] ) . '</td>';
+        echo '<td>' . ( $st['last_attempt'] ? esc_html( $st['last_attempt'] ) : '—' ) . '</td>';
+        echo '<td>' . ( $st['error'] ? esc_html( $st['error'] ) : '—' ) . '</td>';
+        echo '<td>';
+        if ( ! $is_running && in_array( $st['status'], array( 'failed', 'partial', 'not_started', 'success' ), true ) ) {
+            echo '<form method="post" style="display:inline;">';
+            wp_nonce_field( 'seri_backfill_year_action', 'seri_backfill_year_nonce' );
+            echo '<input type="hidden" name="seri_backfill_year" value="' . esc_attr( $y ) . '">';
+            echo '<input type="submit" class="button button-small" value="' . ( $st['status'] === 'success' ? 'Rebuild' : 'Run / Retry' ) . '">';
+            echo '</form>';
+        } else {
+            echo '—';
+        }
+        echo '</td></tr>';
+    }
+    echo '</tbody></table>';
+
+    echo '<div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:15px;">';
+    if ( ! $is_running ) {
+        echo '<form method="post" onsubmit="return confirm(\'Schedule backfill for ' . (int) $range['start'] . '-' . (int) $range['end'] . '?\');">';
+        wp_nonce_field( 'seri_backfill_all_action', 'seri_backfill_all_nonce' );
+        echo '<input type="submit" name="seri_backfill_all" class="button button-primary" value="📦 Backfill All Years (' . (int) $range['start'] . '–' . (int) $range['end'] . ')">';
+        echo '</form>';
+    } else {
+        echo '<p style="color:#2271b1; margin:0;">⏳ Backfill is running in the background. Refresh to see progress.</p>';
+    }
+    echo '<form method="post">';
+    wp_nonce_field( 'seri_backfill_cancel_action', 'seri_backfill_cancel_nonce' );
+    echo '<input type="submit" name="seri_backfill_cancel" class="button button-secondary" value="⏹️ Cancel and clear lock">';
+    echo '</form>';
+    echo '<form method="post" onsubmit="return confirm(\'Delete ALL SERI snapshot history (including pre-5.0.0 snapshots built under the old polarity)? This cannot be undone.\');">';
+    wp_nonce_field( 'seri_purge_history_action', 'seri_purge_history_nonce' );
+    echo '<input type="submit" name="seri_purge_history" class="button button-secondary" style="background:#d63638; color:#fff; border-color:#d63638;" value="🗑️ Purge ALL SERI snapshot history">';
+    echo '</form>';
+    echo '</div>';
+
+    echo '<p style="color:#666; font-size:12px; margin-top:8px;">DQI and vintage in each snapshot reflect the data year actually used per pillar (oldest contributing indicator). Each year runs as its own background job so no single request can time out.</p>';
+    echo '</div></div>';
 }
