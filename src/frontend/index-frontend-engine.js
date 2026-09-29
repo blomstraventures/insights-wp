@@ -1,5 +1,11 @@
 /* =====================================================================
-   Blomstra Index Frontend Engine — v4.1.8
+   Blomstra Index Frontend Engine — v4.2.0
+   - v4.2.0: historical pillar values now display. Snapshot history rows
+     store pillars under a bare key (energy, governance, ...) while the
+     shortcodes declare pillars under different keys. Each pillar can now
+     declare hist_key (falls back to key) and the engine maps through it.
+     Before this, moving the year slider changed score and rank but every
+     pillar view silently fell back to today's live values.
    - Countries Covered: total uses default text color
    - Composite Analytics: all stats use default text color
    - "Compare Blocks" → "Compare Groups"
@@ -104,6 +110,10 @@ if (!window.BIW_COUNTRY_GROUPS) {
         var view = root.getAttribute('data-biw-view') || 'dashboard';
         var pillars = [];
         try { pillars = JSON.parse(root.getAttribute('data-biw-pillars') || '[]'); } catch (e) { pillars = []; }
+        // Snapshot history rows store each pillar under p.hist_key (falls back to p.key).
+        var histKeyMap = {};
+        pillars.forEach(function (p) { histKeyMap[p.key] = p.hist_key || p.key; });
+        function histKeyFor(k) { return histKeyMap[k] || k; }
         var bandThresholds = (root.getAttribute('data-biw-band-thresholds') || '25,50,75').split(',').map(Number);
         var bandLabels = (root.getAttribute('data-biw-band-labels') || 'Very Good,Good,Poor,Very Poor').split(',');
         var bandClasses = ['biw-badge-verygood', 'biw-badge-good', 'biw-badge-poor', 'biw-badge-verypoor'];
@@ -199,11 +209,12 @@ if (!window.BIW_COUNTRY_GROUPS) {
 
         function getHistoricalPillar(iso3, year, pillarKey) {
             var entry = getHistoricalEntry(iso3, year);
-            if (entry && entry.pillars && entry.pillars[pillarKey] !== undefined) {
-                return entry.pillars[pillarKey];
+            var hk = histKeyFor(pillarKey);
+            if (entry && entry.pillars && entry.pillars[hk] !== undefined) {
+                return entry.pillars[hk];
             }
-            if (entry && entry[pillarKey] !== undefined) {
-                return entry[pillarKey];
+            if (entry && entry[hk] !== undefined) {
+                return entry[hk];
             }
             return null;
         }
@@ -1720,7 +1731,13 @@ if (!window.BIW_COUNTRY_GROUPS) {
                 rank = histEntry.rank !== undefined ? histEntry.rank : c.rank;
                 rankDisplay = histEntry.rank_display || c.rank_display;
                 coverage = histEntry.coverage_type || c.coverage;
-                pillarsData = histEntry.pillars || {};
+                // Historical pillar values are stored under p.hist_key; re-key them by p.key
+                // so the loops below can read them uniformly.
+                pillarsData = {};
+                pillars.forEach(function (p) {
+                    var hv = (histEntry.pillars || {})[histKeyFor(p.key)];
+                    if (hv !== undefined) pillarsData[p.key] = hv;
+                });
                 dqi = histEntry.composite_dqi !== undefined ? histEntry.composite_dqi : c.composite_dqi;
                 vintage = histEntry.vintage_summary || c.vintage_summary;
             } else {
