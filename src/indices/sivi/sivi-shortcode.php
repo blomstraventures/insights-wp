@@ -1,10 +1,12 @@
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 add_shortcode( 'blomstra_sivi_index', function () {
+    // hist_key = the key this pillar is stored under in snapshot history rows
+    // (used by the frontend engine to show historical pillar values).
     $pillars = array(
-        array( 'key' => 'energy_dependency_percentile', 'raw_key' => 'energy_dependency_raw', 'label' => 'Energy Dependency', 'color' => '#60a5fa' ),
-        array( 'key' => 'supplier_concentration_percentile', 'raw_key' => 'supplier_concentration_raw', 'label' => 'Supplier Concentration', 'color' => '#f87171' ),
-        array( 'key' => 'maritime_vulnerability_percentile', 'raw_key' => 'maritime_connectivity_raw', 'label' => 'Maritime Exposure', 'color' => '#fb923c' ),
+        array( 'key' => 'energy_dependency_percentile', 'hist_key' => 'energy', 'raw_key' => 'energy_dependency_raw', 'label' => 'Energy Dependency', 'color' => '#60a5fa' ),
+        array( 'key' => 'supplier_concentration_percentile', 'hist_key' => 'hhi', 'raw_key' => 'supplier_concentration_raw', 'label' => 'Supplier Concentration', 'color' => '#f87171' ),
+        array( 'key' => 'maritime_vulnerability_percentile', 'hist_key' => 'maritime', 'raw_key' => 'maritime_connectivity_raw', 'label' => 'Maritime Exposure', 'color' => '#fb923c' ),
     );
     $methodology = 'The Sovereign Infrastructure Vulnerability Index (SIVI) combines three pillars — ' .
         '<strong>Energy Dependency</strong> (EIA, consumption-share-weighted across five fuels), ' .
