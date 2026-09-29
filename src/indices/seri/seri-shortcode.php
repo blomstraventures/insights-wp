@@ -6,6 +6,10 @@
  * using the shared Blomstra Index Frontend engine/styles.
  *
  * Usage: [blomstra_seri_index]
+ *
+ * v5.1.0: year slider range now comes from the SERI snapshot history (same as
+ * SIVI), and each pillar declares hist_key - the key its value is stored under
+ * in snapshot history rows - so the engine can show historical pillar values.
  */
 if ( ! function_exists( 'seri_render_index_shortcode' ) ) {
     function seri_render_index_shortcode( $atts ) {
@@ -17,28 +21,32 @@ if ( ! function_exists( 'seri_render_index_shortcode' ) ) {
         // strong/resilient in that dimension, not at-risk.
         $pillars = array(
             array(
-                'key'     => 'governance_percentile',
-                'raw_key' => null,
-                'label'   => 'Governance Strength',
-                'color'   => '#60a5fa',
+                'key'      => 'governance_percentile',
+                'hist_key' => 'governance',
+                'raw_key'  => null,
+                'label'    => 'Governance Strength',
+                'color'    => '#60a5fa',
             ),
             array(
-                'key'     => 'macro_percentile',
-                'raw_key' => null,
-                'label'   => 'Macro Stability',
-                'color'   => '#34d399',
+                'key'      => 'macro_percentile',
+                'hist_key' => 'macro',
+                'raw_key'  => null,
+                'label'    => 'Macro Stability',
+                'color'    => '#34d399',
             ),
             array(
-                'key'     => 'external_percentile',
-                'raw_key' => null,
-                'label'   => 'External Resilience',
-                'color'   => '#fb923c',
+                'key'      => 'external_percentile',
+                'hist_key' => 'external',
+                'raw_key'  => null,
+                'label'    => 'External Resilience',
+                'color'    => '#fb923c',
             ),
             array(
-                'key'     => 'fiscal_percentile',
-                'raw_key' => null,
-                'label'   => 'Fiscal Strength',
-                'color'   => '#f87171',
+                'key'      => 'fiscal_percentile',
+                'hist_key' => 'fiscal',
+                'raw_key'  => null,
+                'label'    => 'Fiscal Strength',
+                'color'    => '#f87171',
             ),
         );
 
@@ -51,6 +59,7 @@ if ( ! function_exists( 'seri_render_index_shortcode' ) ) {
             . 'Countries missing one pillar receive a projected rank range using global median injection (Partial Index). '
             . 'Countries with fewer than three pillars are excluded. '
             . 'Higher scores indicate greater resilience — the most resilient country is ranked #1. '
+            . 'Historical years are rebuilt with the current methodology from the latest World Bank and IMF data available for each year; they are retrospective reconstructions, not the values that would have been published at the time. '
             . '<a href="' . esc_url( 'https://blomstrainsights.com/methodology/seri' ) . '" target="_blank" rel="noopener">Full methodology →</a>';
 
         $missing_pillar_notes = array(
@@ -59,6 +68,24 @@ if ( ! function_exists( 'seri_render_index_shortcode' ) ) {
             'external'   => 'missing external data (reserves, debt, current account, or divergence)',
             'fiscal'     => 'missing fiscal data (debt, balance, or trajectory)',
         );
+
+        // ─── Dynamic year range from snapshot history ──────────────────
+        global $wpdb;
+        $history_table = $wpdb->prefix . 'blomstra_index_history';
+        $year_min = 2004;
+        $year_max = (int) date( 'Y' );
+        $result = $wpdb->get_row( $wpdb->prepare(
+            "SELECT
+                MIN(CAST(SUBSTRING(snapshot_period, 1, 4) AS UNSIGNED)) as min_year,
+                MAX(CAST(SUBSTRING(snapshot_period, 1, 4) AS UNSIGNED)) as max_year
+             FROM $history_table
+             WHERE index_slug = %s",
+            'seri'
+        ) );
+        if ( $result && $result->min_year !== null && $result->max_year !== null ) {
+            $year_min = (int) $result->min_year;
+            $year_max = (int) $result->max_year;
+        }
 
         ob_start();
         ?>
@@ -80,7 +107,9 @@ if ( ! function_exists( 'seri_render_index_shortcode' ) ) {
             data-biw-band-thresholds="25,50,75"
             data-biw-band-labels="Very Good,Good,Poor,Very Poor"
             data-biw-pillars='<?php echo esc_attr( wp_json_encode( $pillars ) ); ?>'
-            data-biw-methodology="<?php echo esc_attr( $methodology ); ?>">
+            data-biw-methodology="<?php echo esc_attr( $methodology ); ?>"
+            data-biw-year-min="<?php echo esc_attr( $year_min ); ?>"
+            data-biw-year-max="<?php echo esc_attr( $year_max ); ?>">
         </div>
 
         <?php
