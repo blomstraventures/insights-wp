@@ -1,12 +1,12 @@
 /**
- * Sovereign Economic Resilience Index (SERI) — v5.1.0
+ * Sovereign Economic Resilience Index (SERI) — v5.4.0
  *
  * NOTE: This snippet depends on the "Shared Utilities" snippet being active
  *       (blomstra-index-utilities.php). Ensure it is loaded BEFORE this snippet.
  *
  * @package Blomstra\Insights\Indices\SERI
  * @since   3.5.5 (as GERI)
- * @version 5.1.0
+ * @version 5.4.0
  *
  * CHANGES (v5.1.0):
  * - Historical backfill (per-year background jobs, status table, admin panel),
@@ -47,7 +47,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // management rule — it changes the meaning of every historical score,
 // not just the display. See seri_build_composite() for the per-indicator
 // detail.
-define( 'SERI_VERSION', '5.1.0' );
+define( 'SERI_VERSION', '5.4.0' );
 define( 'SERI_OPTION_KEY', 'seri_composite_index' );
 define( 'SERI_CRON_HOOK', 'seri_weekly_refresh' );
 define( 'SERI_DAILY_CRON_HOOK', 'seri_daily_cron' );
@@ -1012,46 +1012,61 @@ function seri_build_composite( $force = false, $context = 'manual', $custom_weig
 
         $structural_scores[ $iso3 ] = $composite;
 
-        // ─── DATA FRESHNESS ──────────────────────────────────────
-        $freshness = array(
-            'governance' => array(
-                'year' => $rows[ $iso3 ]['rule_of_law_year'] ?? null,
-                'source' => $rows[ $iso3 ]['rule_of_law_source'] ?? null,
-            ),
-            'macro' => array(
-                'gni_year' => $rows[ $iso3 ]['gni_growth_year'] ?? null,
-                'gni_source' => $rows[ $iso3 ]['gni_growth_source'] ?? null,
-                'inflation_year' => $rows[ $iso3 ]['inflation_year'] ?? null,
-                'inflation_source' => $rows[ $iso3 ]['inflation_source'] ?? null,
-                'unemployment_year' => $rows[ $iso3 ]['unemployment_year'] ?? null,
-                'unemployment_source' => $rows[ $iso3 ]['unemployment_source'] ?? null,
-                'gdp_volatility_window' => $rows[ $iso3 ]['gdp_volatility_window'] ?? null,
-                'gdp_volatility_observations' => $rows[ $iso3 ]['gdp_volatility_observations'] ?? null,
-                'gdp_volatility_years' => $rows[ $iso3 ]['gdp_volatility_years'] ?? null,
-                'inflation_volatility_window' => $rows[ $iso3 ]['inflation_volatility_window'] ?? null,
-                'inflation_volatility_observations' => $rows[ $iso3 ]['inflation_volatility_observations'] ?? null,
-                'inflation_volatility_years' => $rows[ $iso3 ]['inflation_volatility_years'] ?? null,
-            ),
-            'external' => array(
-                'reserves_year' => $rows[ $iso3 ]['reserve_months_year'] ?? null,
-                'reserves_source' => $rows[ $iso3 ]['reserve_months_source'] ?? null,
-                'debt_year' => $rows[ $iso3 ]['external_debt_year'] ?? null,
-                'debt_source' => $rows[ $iso3 ]['external_debt_source'] ?? null,
-                'current_account_year' => $rows[ $iso3 ]['current_account_year'] ?? null,
-                'current_account_source' => $rows[ $iso3 ]['current_account_source'] ?? null,
-            ),
-            'fiscal' => array(
-                'debt_year' => $rows[ $iso3 ]['gov_debt_year'] ?? null,
-                'debt_source' => $rows[ $iso3 ]['gov_debt_source'] ?? null,
-                'balance_year' => $rows[ $iso3 ]['gov_balance_year'] ?? null,
-                'balance_source' => $rows[ $iso3 ]['gov_balance_source'] ?? null,
-                'trajectory_oldest_year' => $rows[ $iso3 ]['debt_trajectory_oldest_year'] ?? null,
-                'trajectory_newest_year' => $rows[ $iso3 ]['debt_trajectory_newest_year'] ?? null,
-                'trajectory_span' => $rows[ $iso3 ]['debt_trajectory_span'] ?? null,
-                'trajectory_observations' => $rows[ $iso3 ]['debt_trajectory_observations'] ?? null,
-                'trajectory_quality' => $rows[ $iso3 ]['debt_trajectory_quality'] ?? null,
-            ),
+        // ─── DATA FRESHNESS / PROVENANCE ──────────────────────────
+        // BUGFIX (2026-09): previously built per-pillar objects with
+        // ad-hoc, pillar-specific key names (gni_year/gni_source for
+        // macro, debt_year/balance_year for fiscal, etc.) and no
+        // 'available' or 'quality' field at all. The shared frontend's
+        // renderProvenance() expects one flat {available, quality,
+        // source, year} object per pillar (the same shape
+        // blomstra_data_quality_flag() produces for a single indicator).
+        // Since 'available' was always undefined, every pillar for
+        // every country displayed as "Missing" regardless of real
+        // coverage (confirmed live: Sweden, full coverage on every
+        // pillar, still showed "Missing" on all four) — and macro/
+        // external/fiscal additionally showed "unknown (?)" since their
+        // year/source keys never matched what the frontend reads.
+        // Rebuilt here as one pillar-level summary: available = this
+        // pillar actually has a score; year = the oldest contributing
+        // indicator's year (the same measure seri_compute_dqi_fields()
+        // uses for DQI); source = the predominant source across that
+        // pillar's indicators (blomstra_pillar_source_summary(), already
+        // used elsewhere in this function for fiscal_source_summary);
+        // quality classified from how stale that year is, with the SAME
+        // lag thresholds DQI uses, so provenance and the DQI badge
+        // always agree with each other instead of being two unrelated,
+        // independently-computed numbers.
+        $provenance_ref_year  = $is_historical ? (int) $historical['year'] : (int) current_time( 'Y' );
+        $provenance_indicators = array(
+            'governance' => array( 'rule_of_law', 'control_of_corruption', 'political_stability' ),
+            'macro'      => array( 'gni_growth', 'inflation', 'unemployment', 'gdp_volatility', 'inflation_volatility' ),
+            'external'   => array( 'reserve_months', 'external_debt', 'current_account', 'gni_gdp_divergence' ),
+            'fiscal'     => array( 'gov_debt', 'gov_balance', 'debt_trajectory' ),
         );
+        $provenance_dqi_lags = seri_get_dqi_max_lags();
+        $freshness = array();
+        foreach ( $provenance_indicators as $p => $p_inds ) {
+            $p_available = isset( $pillars[ $p ] ) && $pillars[ $p ] !== null;
+            $p_year      = seri_pillar_data_year( $rows[ $iso3 ], $p );
+            $p_dqi       = blomstra_compute_dqi( $p_year, $provenance_ref_year, $provenance_dqi_lags[ $p ] ?? 3 );
+            $p_quality   = 'good';
+            if ( $p_dqi !== null ) {
+                if ( $p_dqi < 40 ) {
+                    $p_quality = 'stale';
+                } elseif ( $p_dqi < 70 ) {
+                    $p_quality = 'aged';
+                }
+            }
+            $p_summary = blomstra_pillar_source_summary( $all_sources, $iso3, $p_inds );
+            $freshness[ $p ] = array(
+                'available'       => $p_available,
+                'staleness_years' => ( $p_year !== null ) ? ( $provenance_ref_year - $p_year ) : null,
+                'source'          => ( $p_summary && ! empty( $p_summary['primary_source'] ) ) ? $p_summary['primary_source'] : null,
+                'scope'           => $p_summary['primary_scope'] ?? null,
+                'quality'         => $p_available ? $p_quality : 'missing',
+                'year'            => $p_year,
+            );
+        }
 
         $missing_pillars_list = array();
         foreach ( array( 'governance', 'macro', 'external', 'fiscal' ) as $p ) {
@@ -2173,36 +2188,69 @@ function seri_render_admin_page() {
 }
 
 // ============================================================================
-// HISTORICAL BACKFILL (SERI v5.1.0)
+// HISTORICAL BACKFILL (SERI v5.3.0)
 //
-// Reuses the SAME reference-data layer SIVI's backfill uses
-// (global-reference-data.php) — nothing in that file is touched or
-// duplicated. Specifically:
-//   - WB indicators: blomstra_fetch_wb_historical_batch() — the existing,
-//     already-cached range fetcher. One call per indicator per country
-//     range; cached as a WordPress transient (1 week), so a later
-//     backfill year reusing the same indicator hits the cache instead of
-//     calling the World Bank API again.
+// v5.3.0 fixes a real bug found after v5.2.0 went live: most backfilled
+// years scored far too few countries, worsening the further back the year
+// (2020-2022 scored 0, 2023-2024 scored a handful, only 2025 looked right).
+// Root cause was in the SHARED blomstra_fetch_wb_historical_batch() in
+// global-reference-data.php: for any indicator with no explicit `source`
+// (10 of our 13 World Bank codes — everything except the 3 WGI/governance
+// ones), it appended `&mrnev=1` ("most recent non-empty value") to the
+// request even when a genuine multi-year date range was also requested.
+// That silently collapsed a wide range (e.g. 1992-2026) down to ONE data
+// point per country instead of a real time series. Point-in-time lookups
+// for a year close to "now" could still reach that one collapsed point via
+// the lookback window; older years could not, and scored almost nothing.
+// See PATCH.md for the one-line fix to that shared function — it does not
+// change any existing single-year caller's behavior.
+// That stale, collapsed data is also sitting in that function's own
+// transient cache (1-week TTL) from earlier runs, so fixing the URL alone
+// doesn't help until it's cleared — see "Clear Cached Series & Reset"
+// below, added for exactly this recovery.
+//
+// v5.2.0 fixed a different, now-resolved problem: a single backfill year
+// previously made 13 World Bank calls + 2 IMF calls INLINE, in one
+// request. On a cold cache that easily took several minutes, which either
+// PHP's own execution limit or the web server's own hard timeout killed
+// mid-request — and a server-level kill happens before PHP ever runs the
+// "mark this year failed" cleanup, which is why a year could sit on
+// "Running" forever with no error. The "Run/Retry" button also ran
+// synchronously inside the admin page load, which is why clicking it left
+// the page blank until it finished or was killed.
+//
+// Fix, in two parts:
+//   1. Fetching is now its own step ("Warm Up Reference Data"): one World
+//      Bank or IMF indicator is fetched per background tick (~15 ticks
+//      total, ~15-20s apart), each tick doing exactly ONE network call.
+//      Results are stored in their own WordPress options (persistent,
+//      autoload off). A year's actual scoring job then reads ONLY from
+//      those options — zero network calls — so it finishes in a few
+//      seconds regardless of hosting timeouts.
+//   2. Every admin action (single-year Run/Retry included) now schedules
+//      a background job and returns immediately, exactly like "Backfill
+//      All" already did — no action blocks the admin page anymore.
+//
+// This still reuses the SAME reference-data layer SIVI's backfill uses
+// (global-reference-data.php is not touched or duplicated):
+//   - WB indicators: blomstra_fetch_wb_historical_batch() — the existing
+//     shared range fetcher, called once per indicator during warm-up.
 //   - IMF indicators (fiscal pillar): the IMF WEO datamapper endpoint
-//     returns a country's FULL time series in one response regardless of
-//     year requested, but every existing helper in this codebase narrows
-//     that response down to a single year before returning it. Since
-//     nothing shared returns the full series, seri_hist_imf_series()
-//     below fetches it once (2 codes total: GGXWDG_NGDP, GGXCNL_NGDP) and
-//     caches it — this is the one genuinely new fetch helper, kept
-//     minimal on purpose.
+//     returns a country's full time series in one response; since no
+//     existing helper returns that full series (every one narrows it to
+//     a single year), the warm-up fetches it directly — 2 codes total,
+//     the one genuinely new fetch this feature needs.
 //   - Scoring: historical years run through seri_build_composite() itself
-//     (new $historical argument) — the exact same pillar math, percentile
-//     ranking, coverage rules and ranking logic as the live build. Only
-//     the input rows differ.
+//     (via its $historical argument) — identical pillar math, percentile
+//     ranking, coverage rules and ranking logic to the live build.
 //   - Snapshot shape: live and historical rows both go through
-//     seri_build_snapshot_rows(), using the same
-//     blomstra_build_flat_snapshot_row() helper SIVI uses, so the two
-//     can never diverge in shape the way SIVI's did before v3.3.0.
+//     seri_build_snapshot_rows() / blomstra_build_flat_snapshot_row(), so
+//     the two can't diverge in shape the way SIVI's did before its own
+//     v3.3.0 fix.
 //
-// A year is never silently built from missing data: if a required WB or
-// IMF series cannot be fetched, the year fails with a message instead of
-// scoring on a hole.
+// A year is never silently built from missing data: if a required series
+// hasn't been warmed up yet, the year fails fast with a clear message
+// instead of hanging.
 // ============================================================================
 
 define( 'SERI_BACKFILL_MIN_YEAR', 2002 );          // first year of annual (non-biennial) WGI releases
@@ -2212,12 +2260,15 @@ define( 'SERI_HIST_PARTIAL_THRESHOLD', 100 );      // fewer scored countries tha
 define( 'SERI_BACKFILL_YEAR_HOOK', 'seri_backfill_year_cron' );
 define( 'SERI_BACKFILL_LOCK_KEY', 'seri_backfill_lock' );
 define( 'SERI_BACKFILL_STATUS_KEY', 'seri_backfill_status' );
+define( 'SERI_HIST_PREFETCH_HOOK', 'seri_hist_prefetch_tick' );
+define( 'SERI_HIST_PREFETCH_LOCK', 'seri_hist_prefetch_lock' );
+define( 'SERI_HIST_PREFETCH_THEN_BACKFILL', 'seri_hist_prefetch_then_backfill' );
+define( 'SERI_HIST_PREFETCH_TICK_GAP', 20 ); // seconds between warm-up ticks — gentle on the host and the API
 
-// ─── WB indicator codes SERI needs, mapped to internal field names ───────
-// (source: null = WDI, 3 = WGI — same convention as BLOMSTRA_WB_INDICATORS)
+// ─── Indicators this feature needs, and where each is stored ─────────────
 
-function seri_hist_wb_code_map() {
-    return array(
+function seri_hist_prefetch_items() {
+    $wb = array(
         'rule_of_law'           => array( 'GOV_WGI_RL.SC', 3 ),
         'control_of_corruption' => array( 'GOV_WGI_CC.SC', 3 ),
         'political_stability'   => array( 'GOV_WGI_PV.SC', 3 ),
@@ -2232,84 +2283,58 @@ function seri_hist_wb_code_map() {
         'gov_debt_wb'           => array( 'GC.DOD.TOTL.GD.ZS', null ),
         'gov_balance_wb'        => array( 'GC.NLD.TOTL.GD.ZS', null ),
     );
+    $items = array();
+    foreach ( $wb as $field => $spec ) {
+        $items[] = array(
+            'type'        => 'wb',
+            'field'       => $field,
+            'code'        => $spec[0],
+            'source'      => $spec[1],
+            'storage_key' => 'seri_hist_series_wb_' . sanitize_key( $field ),
+            'label'       => $spec[0] . ( $spec[1] ? ' (WGI)' : ' (WDI)' ),
+        );
+    }
+    foreach ( array( 'GGXWDG_NGDP' => 'gov_debt_imf', 'GGXCNL_NGDP' => 'gov_balance_imf' ) as $code => $field ) {
+        $items[] = array(
+            'type'        => 'imf',
+            'field'       => $field,
+            'code'        => $code,
+            'source'      => null,
+            'storage_key' => 'seri_hist_series_imf_' . sanitize_key( $field ),
+            'label'       => $code . ' (IMF WEO)',
+        );
+    }
+    return $items;
 }
 
-/**
- * Full time series for one WB indicator: iso3 => [ year => value ].
- * Calls the EXISTING shared range fetcher from global-reference-data.php
- * (blomstra_fetch_wb_historical_batch) with force=false, so it reads that
- * function's own transient cache on repeat calls instead of re-fetching.
- * One request per code covers the whole usable range, reused by every
- * backfill year in this run and by any later run within the cache TTL.
- */
-function seri_hist_wb_series( $code, $source = null ) {
-    static $mem = array();
-    $mem_key = $code . '|' . (string) $source;
-    if ( isset( $mem[ $mem_key ] ) ) {
-        return $mem[ $mem_key ];
-    }
-    if ( ! function_exists( 'blomstra_fetch_wb_historical_batch' ) ) {
-        $mem[ $mem_key ] = array();
-        return array();
-    }
-    $end   = (int) current_time( 'Y' );
-    $start = SERI_BACKFILL_MIN_YEAR - SERI_HIST_LOOKBACK_YEARS - SERI_HIST_VOL_WINDOW_YEARS;
-    $data  = blomstra_fetch_wb_historical_batch( $code, $start, $end, $source, false );
-    $mem[ $mem_key ] = is_array( $data ) ? $data : array();
-    return $mem[ $mem_key ];
+function seri_hist_series_get( $storage_key ) {
+    $stored = get_option( $storage_key, null );
+    return ( is_array( $stored ) && isset( $stored['data'] ) ) ? $stored['data'] : null;
 }
 
-/**
- * Full time series for one IMF WEO indicator: iso3 => [ year => value ].
- * No existing shared function returns a full multi-year series (every one
- * already narrows the datamapper response to a single year), so this
- * fetches the endpoint once per code and caches it — the one new fetch
- * helper this feature needs, scoped to the 2 fiscal codes SERI uses.
- */
-function seri_hist_imf_series( $code ) {
-    static $mem = array();
-    if ( isset( $mem[ $code ] ) ) {
-        return $mem[ $code ];
-    }
-    $cache_key = 'seri_hist_imf_full_' . $code;
-    $cached    = get_transient( $cache_key );
-    if ( is_array( $cached ) ) {
-        $mem[ $code ] = $cached;
-        return $cached;
-    }
-    $out = array();
-    $url = 'https://www.imf.org/external/datamapper/api/v1/' . $code;
-    for ( $attempt = 1; $attempt <= 3; $attempt++ ) {
-        $response = wp_remote_get( $url, array( 'timeout' => 60, 'user-agent' => 'SERI-Direct/' . SERI_VERSION ) );
-        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
-            $body = json_decode( wp_remote_retrieve_body( $response ), true );
-            $map  = defined( 'BLOMSTRA_IMF_TO_ISO3_MAP' ) ? BLOMSTRA_IMF_TO_ISO3_MAP : array();
-            if ( isset( $body['values'][ $code ] ) && is_array( $body['values'][ $code ] ) ) {
-                foreach ( $body['values'][ $code ] as $imf_code => $years ) {
-                    $iso3 = $map[ $imf_code ] ?? $imf_code;
-                    if ( ! is_array( $years ) ) {
-                        continue;
-                    }
-                    foreach ( $years as $y => $v ) {
-                        if ( is_numeric( $v ) ) {
-                            $out[ $iso3 ][ (int) $y ] = (float) $v;
-                        }
-                    }
-                }
-            }
-        }
-        if ( ! empty( $out ) ) {
-            break;
-        }
-        if ( $attempt < 3 ) {
-            sleep( 3 * $attempt );
+function seri_hist_series_set( $storage_key, $data ) {
+    update_option( $storage_key, array( 'data' => $data, 'fetched_at' => current_time( 'mysql' ) ), false );
+}
+
+/** Read-only lookups used by the (fast) per-year scoring job. */
+function seri_hist_wb_series( $field ) {
+    foreach ( seri_hist_prefetch_items() as $item ) {
+        if ( $item['type'] === 'wb' && $item['field'] === $field ) {
+            $data = seri_hist_series_get( $item['storage_key'] );
+            return is_array( $data ) ? $data : array();
         }
     }
-    if ( ! empty( $out ) ) {
-        set_transient( $cache_key, $out, WEEK_IN_SECONDS );
+    return array();
+}
+
+function seri_hist_imf_series( $field ) {
+    foreach ( seri_hist_prefetch_items() as $item ) {
+        if ( $item['type'] === 'imf' && $item['field'] === $field ) {
+            $data = seri_hist_series_get( $item['storage_key'] );
+            return is_array( $data ) ? $data : array();
+        }
     }
-    $mem[ $code ] = $out;
-    return $out;
+    return array();
 }
 
 /** Most recent value at or before $year, no older than $lookback years. */
@@ -2340,7 +2365,121 @@ function seri_hist_window( $country_series, $from, $to ) {
     return $out;
 }
 
-// ─── Historical data assembly ─────────────────────────────────────────────
+// ─── Warm-up: fetch exactly one indicator per tick ─────────────────────────
+
+function seri_hist_prefetch_status() {
+    $items  = seri_hist_prefetch_items();
+    $total  = count( $items );
+    $cached = 0;
+    $rows   = array();
+    foreach ( $items as $item ) {
+        $data     = seri_hist_series_get( $item['storage_key'] );
+        $has_data = is_array( $data ) && ! empty( $data );
+        if ( $has_data ) {
+            $cached++;
+        }
+        $rows[] = array(
+            'label'    => $item['label'],
+            'cached'   => $has_data,
+            'countries' => $has_data ? count( $data ) : 0,
+        );
+    }
+    return array( 'total' => $total, 'cached' => $cached, 'ready' => ( $cached === $total ), 'rows' => $rows );
+}
+
+/** Fetch ONE item's series. Returns true on success, false on failure. */
+function seri_hist_prefetch_fetch_one( $item ) {
+    if ( $item['type'] === 'wb' ) {
+        if ( ! function_exists( 'blomstra_fetch_wb_historical_batch' ) ) {
+            return false;
+        }
+        $end   = (int) current_time( 'Y' );
+        $start = SERI_BACKFILL_MIN_YEAR - SERI_HIST_LOOKBACK_YEARS - SERI_HIST_VOL_WINDOW_YEARS;
+        $data  = blomstra_fetch_wb_historical_batch( $item['code'], $start, $end, $item['source'], false );
+        if ( ! is_array( $data ) || empty( $data ) ) {
+            return false;
+        }
+        seri_hist_series_set( $item['storage_key'], $data );
+        return true;
+    }
+
+    // IMF: the datamapper endpoint returns the whole series in one response.
+    $out = array();
+    $url = 'https://www.imf.org/external/datamapper/api/v1/' . $item['code'];
+    $response = wp_remote_get( $url, array( 'timeout' => 45, 'user-agent' => 'SERI-Direct/' . SERI_VERSION ) );
+    if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+        $map  = defined( 'BLOMSTRA_IMF_TO_ISO3_MAP' ) ? BLOMSTRA_IMF_TO_ISO3_MAP : array();
+        if ( isset( $body['values'][ $item['code'] ] ) && is_array( $body['values'][ $item['code'] ] ) ) {
+            foreach ( $body['values'][ $item['code'] ] as $imf_code => $years ) {
+                $iso3 = $map[ $imf_code ] ?? $imf_code;
+                if ( ! is_array( $years ) ) {
+                    continue;
+                }
+                foreach ( $years as $y => $v ) {
+                    if ( is_numeric( $v ) ) {
+                        $out[ $iso3 ][ (int) $y ] = (float) $v;
+                    }
+                }
+            }
+        }
+    }
+    if ( empty( $out ) ) {
+        return false;
+    }
+    seri_hist_series_set( $item['storage_key'], $out );
+    return true;
+}
+
+add_action( SERI_HIST_PREFETCH_HOOK, 'seri_hist_prefetch_tick_callback' );
+function seri_hist_prefetch_tick_callback() {
+    if ( ! get_transient( SERI_HIST_PREFETCH_LOCK ) ) {
+        return; // cancelled
+    }
+    if ( function_exists( 'set_time_limit' ) ) {
+        @set_time_limit( 90 ); // this tick does exactly one network call
+    }
+
+    $next = null;
+    foreach ( seri_hist_prefetch_items() as $item ) {
+        $data = seri_hist_series_get( $item['storage_key'] );
+        if ( ! is_array( $data ) || empty( $data ) ) {
+            $next = $item;
+            break;
+        }
+    }
+
+    if ( $next === null ) {
+        // Everything is warmed up.
+        delete_transient( SERI_HIST_PREFETCH_LOCK );
+        $chain = get_option( SERI_HIST_PREFETCH_THEN_BACKFILL, null );
+        if ( is_array( $chain ) ) {
+            delete_option( SERI_HIST_PREFETCH_THEN_BACKFILL );
+            seri_backfill_schedule_years( (int) $chain['start'], (int) $chain['end'] );
+        }
+        return;
+    }
+
+    $ok = seri_hist_prefetch_fetch_one( $next );
+    if ( ! $ok ) {
+        error_log( 'SERI warm-up: failed to fetch ' . $next['label'] . ' — will retry on the next tick.' );
+    }
+    wp_schedule_single_event( time() + SERI_HIST_PREFETCH_TICK_GAP, SERI_HIST_PREFETCH_HOOK );
+}
+
+function seri_hist_prefetch_start( $then_backfill_range = null ) {
+    if ( get_transient( SERI_HIST_PREFETCH_LOCK ) !== false ) {
+        return false; // already running
+    }
+    set_transient( SERI_HIST_PREFETCH_LOCK, time(), HOUR_IN_SECONDS );
+    if ( is_array( $then_backfill_range ) ) {
+        update_option( SERI_HIST_PREFETCH_THEN_BACKFILL, $then_backfill_range, false );
+    }
+    wp_schedule_single_event( time() + 3, SERI_HIST_PREFETCH_HOOK );
+    return true;
+}
+
+// ─── Historical data assembly (reads the warmed-up cache only — no network) ──
 
 /**
  * Build the merged per-country raw rows (and source map) for one year, in
@@ -2354,29 +2493,17 @@ function seri_hist_build_rows( $year, $countries ) {
     $year = (int) $year;
     $lb   = SERI_HIST_LOOKBACK_YEARS;
 
-    $wb       = array();
-    $missing  = array();
-    foreach ( seri_hist_wb_code_map() as $field => $spec ) {
-        list( $code, $source ) = $spec;
-        $series = seri_hist_wb_series( $code, $source );
-        if ( empty( $series ) ) {
-            $missing[] = $code;
-        }
-        $wb[ $field ] = $series;
+    $status = seri_hist_prefetch_status();
+    if ( ! $status['ready'] ) {
+        return array( 'error' => 'Reference data not warmed up yet (' . $status['cached'] . ' of ' . $status['total'] . ' series cached). Click "Warm Up Reference Data" and wait for it to finish, then retry.' );
     }
 
-    $imf_debt    = seri_hist_imf_series( 'GGXWDG_NGDP' );
-    $imf_balance = seri_hist_imf_series( 'GGXCNL_NGDP' );
-    if ( empty( $imf_debt ) ) {
-        $missing[] = 'IMF:GGXWDG_NGDP';
+    $wb = array();
+    foreach ( array( 'rule_of_law', 'control_of_corruption', 'political_stability', 'gni_growth', 'gni_growth_percap', 'inflation', 'unemployment', 'gdp_growth', 'reserve_months', 'external_debt', 'current_account', 'gov_debt_wb', 'gov_balance_wb' ) as $field ) {
+        $wb[ $field ] = seri_hist_wb_series( $field );
     }
-    if ( empty( $imf_balance ) ) {
-        $missing[] = 'IMF:GGXCNL_NGDP';
-    }
-
-    if ( ! empty( $missing ) ) {
-        return array( 'error' => 'Could not fetch: ' . implode( ', ', $missing ) . '. Check network/API access and retry.' );
-    }
+    $imf_debt    = seri_hist_imf_series( 'gov_debt_imf' );
+    $imf_balance = seri_hist_imf_series( 'gov_balance_imf' );
 
     $rows    = array();
     $sources = array();
@@ -2596,14 +2723,14 @@ function seri_build_snapshot_rows( $country_output ) {
     return $snap;
 }
 
-// ─── One historical year ──────────────────────────────────────────────────
+// ─── One historical year (fast: no network calls once warmed up) ──────────
 
 function seri_build_historical_snapshot( $year ) {
     if ( ! function_exists( 'blomstra_index_snapshot_save' ) || ! function_exists( 'blomstra_build_flat_snapshot_row' ) ) {
         return array( 'success' => false, 'countries' => 0, 'error' => 'Shared utilities not active (blomstra_index_snapshot_save / blomstra_build_flat_snapshot_row missing).' );
     }
     if ( function_exists( 'set_time_limit' ) ) {
-        @set_time_limit( 300 );
+        @set_time_limit( 120 );
     }
     $countries = function_exists( 'blomstra_get_global_country_list' ) ? blomstra_get_global_country_list() : array();
     if ( empty( $countries ) ) {
@@ -2687,9 +2814,20 @@ function seri_backfill_check_completion() {
     error_log( 'SERI backfill completed - lock cleared.' );
 }
 
-/**
- * Run + record one year. Used by the cron job and by the admin Retry button.
- */
+/** Schedule one background job per year in [$start, $end]. */
+function seri_backfill_schedule_years( $start, $end ) {
+    set_transient( SERI_BACKFILL_LOCK_KEY, time(), 2 * HOUR_IN_SECONDS );
+    $i = 0;
+    for ( $y = $start; $y <= $end; $y++, $i++ ) {
+        // Each job now only reads already-cached data and scores it, so a
+        // short, even stagger is enough — no need for the wide spacing a
+        // network-bound job would have needed.
+        wp_schedule_single_event( time() + 10 + ( $i * 20 ), SERI_BACKFILL_YEAR_HOOK, array( $y ) );
+        seri_update_backfill_status( $y, 'scheduled', 0, null );
+    }
+}
+
+/** Run + record one year. Always invoked via cron — never inline in a page load. */
 function seri_run_backfill_year( $year ) {
     $year = (int) $year;
     seri_update_backfill_status( $year, 'running', null, null );
@@ -2744,18 +2882,61 @@ function seri_backfill_handle_actions() {
         }
     }
 
+    if ( isset( $_POST['seri_hist_warm_up'] ) && check_admin_referer( 'seri_hist_warm_up_action', 'seri_hist_warm_up_nonce' ) ) {
+        $started = seri_hist_prefetch_start();
+        if ( $started ) {
+            echo '<div class="notice notice-success"><p>🔄 Warming up reference data in the background — about 15 short steps, ~20 seconds apart. Refresh this page to watch progress.</p></div>';
+        } else {
+            echo '<div class="notice notice-warning"><p>⚠️ A warm-up is already running.</p></div>';
+        }
+    }
+
+    if ( isset( $_POST['seri_hist_warm_up_cancel'] ) && check_admin_referer( 'seri_hist_warm_up_cancel_action', 'seri_hist_warm_up_cancel_nonce' ) ) {
+        delete_transient( SERI_HIST_PREFETCH_LOCK );
+        delete_option( SERI_HIST_PREFETCH_THEN_BACKFILL );
+        echo '<div class="notice notice-warning"><p>⏹️ Warm-up cancelled.</p></div>';
+    }
+
+    if ( isset( $_POST['seri_hist_clear_and_rewarm'] ) && check_admin_referer( 'seri_hist_clear_and_rewarm_action', 'seri_hist_clear_and_rewarm_nonce' ) ) {
+        delete_transient( SERI_HIST_PREFETCH_LOCK );
+        delete_option( SERI_HIST_PREFETCH_THEN_BACKFILL );
+        $end   = (int) current_time( 'Y' );
+        $start = SERI_BACKFILL_MIN_YEAR - SERI_HIST_LOOKBACK_YEARS - SERI_HIST_VOL_WINDOW_YEARS;
+        foreach ( seri_hist_prefetch_items() as $item ) {
+            delete_option( $item['storage_key'] );
+            if ( $item['type'] === 'wb' ) {
+                // v5.3.0 recovery: also bust the SHARED World Bank range-fetch
+                // cache for this exact (code, source, range) — it still holds
+                // the collapsed, pre-fix data from earlier runs (1-week TTL),
+                // keyed the same way blomstra_fetch_wb_historical_batch()
+                // computes its own cache key.
+                $shared_key = 'blomstra_wb_historical_' . md5( $item['code'] . '|' . (string) $item['source'] . '|' . $start . '|' . $end );
+                delete_transient( $shared_key );
+                delete_transient( $shared_key . '_tmp' );
+            }
+        }
+        delete_option( SERI_BACKFILL_STATUS_KEY );
+        echo '<div class="notice notice-warning"><p>🧹 Cleared all cached reference series for SERI\'s backfill, including the shared World Bank cache entries affected by the mrnev/date-range bug, and reset backfill status. Click "Warm Up Reference Data" to refetch with the fix applied.</p></div>';
+    }
+
     if ( isset( $_POST['seri_backfill_all'] ) && check_admin_referer( 'seri_backfill_all_action', 'seri_backfill_all_nonce' ) ) {
         if ( get_transient( SERI_BACKFILL_LOCK_KEY ) !== false ) {
             echo '<div class="notice notice-warning"><p>⚠️ Backfill is already running. Use "Cancel and clear lock" if it is stuck.</p></div>';
         } else {
-            set_transient( SERI_BACKFILL_LOCK_KEY, time(), 2 * HOUR_IN_SECONDS );
-            $range = seri_get_backfill_range();
-            $i = 0;
-            for ( $y = $range['start']; $y <= $range['end']; $y++, $i++ ) {
-                wp_schedule_single_event( time() + 30 + ( $i * 90 ), SERI_BACKFILL_YEAR_HOOK, array( $y ) );
-                seri_update_backfill_status( $y, 'scheduled', 0, null );
+            $range  = seri_get_backfill_range();
+            $status = seri_hist_prefetch_status();
+            if ( $status['ready'] ) {
+                seri_backfill_schedule_years( $range['start'], $range['end'] );
+                echo '<div class="notice notice-success"><p>✅ Backfill scheduled for ' . $range['start'] . '–' . $range['end'] . ' (' . ( $range['end'] - $range['start'] + 1 ) . ' background jobs, ~20 seconds apart). Refresh this page to follow progress.</p></div>';
+            } else {
+                $started = seri_hist_prefetch_start( $range );
+                if ( $started ) {
+                    echo '<div class="notice notice-info"><p>🔄 Reference data isn\'t warmed up yet (' . $status['cached'] . ' of ' . $status['total'] . ' series cached) — warming it up first, then the ' . $range['start'] . '–' . $range['end'] . ' backfill will start automatically. Refresh this page to follow progress.</p></div>';
+                } else {
+                    echo '<div class="notice notice-warning"><p>⚠️ Warm-up is already running — the backfill will start automatically once it finishes.</p></div>';
+                    update_option( SERI_HIST_PREFETCH_THEN_BACKFILL, $range, false );
+                }
             }
-            echo '<div class="notice notice-success"><p>✅ Backfill scheduled for ' . $range['start'] . '–' . $range['end'] . ': one background job per year (90-second stagger). Refresh this page to follow progress.</p></div>';
         }
     }
 
@@ -2765,12 +2946,12 @@ function seri_backfill_handle_actions() {
         if ( $year < $range['start'] || $year > $range['end'] ) {
             echo '<div class="notice notice-error"><p>Invalid year. Must be between ' . $range['start'] . ' and ' . $range['end'] . '.</p></div>';
         } else {
-            $result = seri_run_backfill_year( $year );
-            if ( $result['success'] ) {
-                echo '<div class="notice notice-success"><p>✅ Backfill for ' . $year . ' completed – ' . (int) $result['countries'] . ' countries saved.</p></div>';
-            } else {
-                echo '<div class="notice notice-error"><p>❌ Backfill for ' . $year . ' failed: ' . esc_html( $result['error'] ) . '</p></div>';
-            }
+            // v5.2.0: always scheduled in the background — never run inline
+            // during the admin page load (that was why the page went blank).
+            set_transient( SERI_BACKFILL_LOCK_KEY, time(), 2 * HOUR_IN_SECONDS );
+            wp_schedule_single_event( time() + 5, SERI_BACKFILL_YEAR_HOOK, array( $year ) );
+            seri_update_backfill_status( $year, 'scheduled', 0, null );
+            echo '<div class="notice notice-success"><p>✅ ' . $year . ' queued for background processing. Refresh this page in a few seconds to see the result.</p></div>';
         }
     }
 
@@ -2799,14 +2980,49 @@ function seri_backfill_handle_actions() {
 // ─── Admin: panel (called inside seri_render_admin_page) ──────────────────
 
 function seri_render_backfill_box() {
-    $range      = seri_get_backfill_range();
-    $status     = seri_get_backfill_status();
-    $is_running = ( get_transient( SERI_BACKFILL_LOCK_KEY ) !== false );
+    $range         = seri_get_backfill_range();
+    $status        = seri_get_backfill_status();
+    $is_running    = ( get_transient( SERI_BACKFILL_LOCK_KEY ) !== false );
+    $prefetch      = seri_hist_prefetch_status();
+    $warming_up    = ( get_transient( SERI_HIST_PREFETCH_LOCK ) !== false );
 
     echo '<div class="postbox" style="border-left:4px solid #9b51e0; background:#fff;">';
     echo '<div class="postbox-header"><h2 class="hndle"><span class="dashicons dashicons-backup"></span> 📅 Historical Backfill</h2></div>';
     echo '<div class="inside">';
     echo '<p style="color:#666;">Builds one snapshot per year using the <strong>current</strong> SERI methodology (v' . esc_html( SERI_VERSION ) . '), from the same World Bank / IMF reference data used by the rest of this plugin. Values are the latest observation at or before each year (World Bank/IMF revise their series, so this is a reconstruction using today\'s published numbers, not what SERI would have shown at the time). Data older than ' . (int) SERI_HIST_LOOKBACK_YEARS . ' years is not carried forward.</p>';
+
+    // ─── Reference data cache status ───────────────────────────────
+    echo '<div style="background:#f7f4fb; border:1px solid #e0d5f0; border-radius:6px; padding:12px 16px; margin-bottom:15px;">';
+    echo '<p style="margin:0 0 8px 0;"><strong>Reference data cache:</strong> ' . $prefetch['cached'] . ' of ' . $prefetch['total'] . ' series ready' . ( $prefetch['ready'] ? ' ✅' : '' ) . '.';
+    if ( $warming_up ) {
+        echo ' <span style="color:#2271b1;">⏳ Warming up now — refresh to watch progress.</span>';
+    }
+    echo '</p>';
+    if ( ! $prefetch['ready'] ) {
+        echo '<details style="margin-bottom:8px;"><summary style="cursor:pointer; color:#2271b1;">Show series status</summary><ul style="margin:6px 0 0 20px;">';
+        foreach ( $prefetch['rows'] as $row ) {
+            echo '<li>' . ( $row['cached'] ? '✅' : '⬜' ) . ' ' . esc_html( $row['label'] ) . ( $row['cached'] ? ' (' . (int) $row['countries'] . ' countries)' : '' ) . '</li>';
+        }
+        echo '</ul></details>';
+    }
+    echo '<div style="display:flex; gap:10px;">';
+    if ( ! $warming_up ) {
+        echo '<form method="post" style="display:inline;">';
+        wp_nonce_field( 'seri_hist_warm_up_action', 'seri_hist_warm_up_nonce' );
+        echo '<input type="submit" name="seri_hist_warm_up" class="button button-secondary" value="🔄 Warm Up Reference Data">';
+        echo '</form>';
+    } else {
+        echo '<form method="post" style="display:inline;">';
+        wp_nonce_field( 'seri_hist_warm_up_cancel_action', 'seri_hist_warm_up_cancel_nonce' );
+        echo '<input type="submit" name="seri_hist_warm_up_cancel" class="button button-secondary" value="⏹️ Cancel Warm-Up">';
+        echo '</form>';
+    }
+    echo '<form method="post" style="display:inline;" onsubmit="return confirm(\'This clears all cached World Bank/IMF series for SERI\\\'s backfill (including the shared World Bank cache entries affected by the mrnev/date-range bug) and resets backfill status. Continue?\');">';
+    wp_nonce_field( 'seri_hist_clear_and_rewarm_action', 'seri_hist_clear_and_rewarm_nonce' );
+    echo '<input type="submit" name="seri_hist_clear_and_rewarm" class="button button-secondary" value="🧹 Clear Cached Series &amp; Reset">';
+    echo '</form>';
+    echo '</div>';
+    echo '</div>';
 
     echo '<form method="post" style="margin-bottom:12px;">';
     wp_nonce_field( 'seri_backfill_range_action', 'seri_backfill_range_nonce' );
@@ -2828,7 +3044,7 @@ function seri_render_backfill_box() {
         echo '<td>' . ( $st['last_attempt'] ? esc_html( $st['last_attempt'] ) : '—' ) . '</td>';
         echo '<td>' . ( $st['error'] ? esc_html( $st['error'] ) : '—' ) . '</td>';
         echo '<td>';
-        if ( ! $is_running && in_array( $st['status'], array( 'failed', 'partial', 'not_started', 'success' ), true ) ) {
+        if ( in_array( $st['status'], array( 'failed', 'partial', 'not_started', 'success' ), true ) ) {
             echo '<form method="post" style="display:inline;">';
             wp_nonce_field( 'seri_backfill_year_action', 'seri_backfill_year_nonce' );
             echo '<input type="hidden" name="seri_backfill_year" value="' . esc_attr( $y ) . '">';
@@ -2860,6 +3076,6 @@ function seri_render_backfill_box() {
     echo '</form>';
     echo '</div>';
 
-    echo '<p style="color:#666; font-size:12px; margin-top:8px;">DQI and vintage in each snapshot reflect the data year actually used per pillar (oldest contributing indicator). Each year runs as its own background job so no single request can time out.</p>';
+    echo '<p style="color:#666; font-size:12px; margin-top:8px;">Every button here queues a background job and returns immediately — nothing runs inline on this page anymore, so clicking a button will never leave the page blank. Refresh to see progress. DQI and vintage in each snapshot reflect the data year actually used per pillar (oldest contributing indicator).</p>';
     echo '</div></div>';
 }
