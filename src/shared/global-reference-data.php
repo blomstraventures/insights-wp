@@ -2511,7 +2511,17 @@ if ( ! function_exists( 'blomstra_fetch_wb_historical_batch' ) ) {
         $url = "https://api.worldbank.org/v2/country/all/indicator/{$code}?format=json&per_page=20000&date={$start_year}:{$end_year}";
         if ( $source ) {
             $url .= "&source={$source}";
-        } else {
+        } elseif ( $start_year === $end_year ) {
+            // BUGFIX (2026-09): mrnev=1 ("most recent non-empty value")
+            // contradicts requesting a genuine multi-year date range — it
+            // silently collapsed a wide-range call (e.g. 1992:2026) down to
+            // one data point per country instead of the real time series.
+            // Every existing caller of this function passes start_year ===
+            // end_year (a single-year lookup), where mrnev is harmless and
+            // intended; only add it in that case so single-year callers
+            // (blomstra_fetch_wb_for_year, the Historical Cache Manager)
+            // keep their exact existing behavior, while a genuine range
+            // request now gets a genuine range back.
             $url .= '&mrnev=1';
         }
 
