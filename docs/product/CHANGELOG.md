@@ -1,120 +1,9 @@
-# Changelog — insights-wp Bug-Fix & Methodology Session
-
-**Base commit:** `fc46520e8585a34c03221bbba983e510dd77ba51` (branch `main`)
-**Scope:** 8 files — `global-reference-data.php`, `blomstra-index-utilities.php`, `blomstra-index-alerts.php` (read only, no changes), `sivi-backend.php` (no functional changes), `sivi-shortcode.php`, `seri-backend.php`, `seri-shortcode.php`, `index-frontend-engine.js`, `index-frontend-styles.css`
-
-This document exists so the current live code can be diffed against the original GitHub baseline and every change accounted for. Grouped by file, in the order changes were made. Each entry states what changed and why.
-
----
-
-## `src/shared/global-reference-data.php`
-
-1. **[Critical] HHI data corruption on total-failure runs.** A run where every fetchable country returned `permanent_failure` could overwrite good production HHI data with nulls. `array_merge()` let a null-valued failure placeholder overwrite an existing valid value; the promotion gate counted raw array-key count instead of valid-value count. Fixed: merge now excludes null-valued results before staging; gate counts non-null entries only.
-2. **[High] HHI cron status misclassification.** A 100%-failure run was reported `'success'` — the completion check only looked for retryable/pending/quota states, never checking whether anything succeeded. Fixed: an explicit all-failed check now reports `'error'`.
-3. **[High] EIA cron status misclassification.** Same pattern — "all fuels processed" was reported success regardless of whether any fuel actually fetched data. Fixed: checks how many fuels ended up permanently failed before reporting success.
-4. **[High] World Bank indicators cron status misclassification.** Same pattern, plus it only checked the current tick's batch of 3, not the whole run. Fixed: pointer now tracks a cumulative `failed_total` across all ticks of a run (`blomstra_get_wb_pointer()` / `blomstra_update_wb_pointer()` signatures extended); completion reports error/partial/success based on the whole run.
-5. **[Major root cause correction] Comtrade 403 misclassification.** UN Comtrade returns HTTP 403 for both genuine auth failure and for exceeding call-volume quota. Every 403 was being treated as a permanent, bad-key failure. Fixed: the 403 handler now inspects the response body for "quota" and reclassifies as `QUOTA_EXHAUSTED` (temporary) instead of `PERMANENT_FAILURE` when detected, extracting the "resets in HH:MM:SS" countdown into the log.
-6. **[Critical] HHI infinite loop — three-layer fix:**
-   - **Root cause:** the cron handler always called `blomstra_refresh_comtrade_hhi_data(null, null, true)` — `force=true` unconditionally resets all progress on *every* invocation, including the debounced 60-second self-reschedule whose entire purpose is to resume a quota-interrupted run. Resumption could never actually happen. Fixed: changed the call to `force=false`, letting the function's own correct internal reset-vs-resume logic take effect.
-   - **Secondary:** a quota-interrupted chunk exited before ever incrementing `$attempts`, so a chunk unlucky enough to repeatedly hit the quota cutoff could make zero progress toward `BLOMSTRA_HHI_MAX_ATTEMPTS` forever. Fixed: quota interruption now credits an attempt and checks the threshold itself.
-   - **Backstop:** added a `cycle_runs` counter to the HHI pointer (`blomstra_get_hhi_pointer()` / `blomstra_update_hhi_pointer()` signatures extended with a 5th parameter), incremented on every resumption; forces the cycle to terminate after 30 resumptions regardless of cause. Threaded through all 5 pointer-save call sites in the function.
-7. **[Robustness] HHI time-budget safety net.** Added a self-imposed 480-second internal time budget checked at the top of each chunk iteration, so the function always reaches its final status-update code before any real PHP execution-time hard-kill, instead of risking a silent freeze at `'running'` forever.
-8. **[Security + data-loss bug] API credential handling.** The real Comtrade/EIA key was being echoed into a `type="password"` field's `value` attribute — visible in page source despite appearing masked. This also meant a blank field on save was treated as "clear the credential," so simply re-saving the settings page without retyping a key wiped it. Fixed: fields now render blank with a `CONFIGURED ✓ (••••last4chars)` hint instead of the secret; a blank submission now means "leave unchanged"; an explicit checkbox is required to actually clear a key.
-9. **[Bug, found during verification] Broken inline PHP tag inside a JavaScript string.** The historical-cache-manager admin screen embedded a literal `<?php wp_nonce_field(...); ?>` tag inside a `<script>` block's JS string — real, executable PHP that ran once server-side and corrupted the rendered script. Fixed: the nonce is now computed once, server-side, and passed into JS as a plain variable.
-10. **[Structural, reverted] Missing opening `<?php` tag.** Initially added `<?php` to the top of this file (and the other 6) believing it was a build-pipeline artifact. This was wrong: the plugin runs as WPCode snippets executed via `eval()`, which assumes its input is already in PHP mode — adding the tag broke the live site (WPCode auto-deactivated the snippet, taking down `admin_menu` registration). **Reverted** — the file correctly has no leading `<?php`, as originally committed.
-
-## `src/shared/blomstra-index-utilities.php`
-
-11. **[Critical, affects every index] `blomstra_build_partial_rank_display()` mislabeled its own low/high range.** It assumed injection point 10 always produces the smaller (better) rank number and point 90 always the bigger one, without checking. That assumption is backwards for every index on this engine — a lower injected value always pushes the composite further from rank #1, so point 10 actually produces the *bigger* rank number. Result: partial-coverage countries could display ranges like `#37–9*` (first number bigger than the second). Fixed with `min()`/`max()` so the range is correctly ordered regardless of which direction either point's rank comes out — a universal fix, not specific to either index's orientation.
-
-## `src/indices/sivi/sivi-shortcode.php`
-
-12. **Band labels updated** from `"Low,Medium,High,Extreme"` to `"Very Good,Good,Poor,Very Poor"` — see the label/color scheme redesign below. No other changes to this file (the earlier `<?php` addition was reverted, net no change).
-
-## `src/indices/seri/seri-backend.php`
-
-13. **[Live-crash bug] Wrong field name.** Displayed `$seri_status['last_run']` and `$last_cron['seri_daily']['last_run']`, a field name `blomstra_update_cron_status()` never writes (it writes `last_attempt`). Caused a fatal error that got the live WPCode snippet auto-deactivated. Fixed all 7 occurrences.
-14. **[High] Daily and weekly cron status misclassification** — both reported `'success'` unconditionally regardless of whether `seri_build_composite()` returned an error. Fixed with the same error-check pattern as the reference-data layer.
-15. **[Major, Version 5.0.0] Full methodology polarity flip.** Every indicator across all four pillars (governance, macro, external, fiscal) was built so a HIGH value meant more at-risk — internally 100% consistent, but the wrong direction for a resilience index, and contradicting its own name and public methodology text. Flipped every indicator's sign at the source (governance: removed the `100 - raw` inversion; macro/external/fiscal: swapped which indicators get negated). `SERI_VERSION` bumped `4.3.0` → `5.0.0`; `standard_version` bumped `BMS-1.1.0` → `BMS-1.2.0` (Major, since it changes the meaning of every historical score).
-16. **[Critical, my own mistake from the flip above] Stale pre-flip rank-sort direction.** A block computing `rank_display` for both full- and partial-coverage countries still had `asort()` (ascending) with a comment saying "lowest score = most resilient" — correct before the flip, backwards after it. This corrupted the backend's stored rank for every SERI country (full-coverage countries only looked right because the frontend's client-side rank recompute overrides the backend value for them). Fixed: `arsort()` (descending) plus the matching comparison-direction flip in the partial-rank counting loop.
-
-## `src/indices/seri/seri-shortcode.php`
-
-17. Pillar labels updated to positive/strength framing matching the methodology flip: "Governance Risk" → "Governance Strength", "Macro Vulnerability" → "Macro Stability" (already matched the internal pillar name), "External Vulnerability" → "External Resilience", "Fiscal Stress" → "Fiscal Strength".
-18. Methodology text and subtitle rewritten for the new polarity ("higher score = more resilient" instead of "lower score = higher resilience").
-19. Score label changed from "Structural Score" to "Resilience Score".
-20. Added `data-biw-orientation="higher_is_better"` and `data-biw-metric-name="Resilience"` — the two new engine config attributes (see below).
-21. Removed two dead, never-implemented config attributes discovered along the way: `data-biw-sort-direction="asc"` and `data-biw-band-select-label` — confirmed via grep that the engine never read either one.
-22. Band labels set to `"Very Good,Good,Poor,Very Poor"` (see label/color scheme redesign below) — went through one incorrect intermediate state (reversed label order, `"Extreme,High,Medium,Low"`) which was reverted after user testing showed it was wrong; final state uses the same label string as SIVI, with the engine's orientation flag handling the direction automatically.
-
-## `src/frontend/index-frontend-engine.js`
-
-### New shared engine capability (added to support SERI sharing this engine with SIVI)
-23. Added `data-biw-orientation` config attribute (`"higher_is_worse"` default / `"higher_is_better"`), read once at widget construction.
-24. Added `data-biw-metric-name` config attribute (default `"Vulnerability"`), used to genericize card titles, dropdown text, and extremes-panel headers instead of hardcoding "Vulnerability".
-25. Added shared helper `orientedBandColors()` — the single source of truth for the 4-color band array, reversed when `orientation === 'higher_is_better'`.
-26. Added shared helper `orientedBandIndex(b)` — same reversal logic, applied to band **labels** (see label/color redesign below).
-27. Added shared helper `deltaColorClass(type)` — orientation-aware color-class selection for rank-movement arrows, used by both the table and the drawer.
-
-### Consolidated duplicate band-color/label logic (12 separate hardcoded copies found and fixed across several rounds)
-Each of the following independently hardcoded the same band-to-color or band-to-label mapping, none aware of orientation. All now route through the shared helpers above:
-28. `getCountryColor()` — map choropleth fill.
-29. `getColor()` — feeds the drawer's score display, movers list, scatter plot dots, and block-comparison badges.
-30. The donut (band-distribution) chart's slice fill.
-31. The histogram bars.
-32. The map's own legend (also previously hardcoded the label text, ignoring the configured `bandLabels`).
-33. The "Resilience/Vulnerability Levels" summary panel — this one used fixed CSS classes (`dist-dot extreme/high/medium/low`) tied to fixed stylesheet colors, not JS logic at all; converted to inline oriented colors.
-34. **`badgeHtml()`** — the function rendering the actual score badge **in the table** — had its own direct `bandClasses[b]` lookup bypassing `getRiskClass()` entirely. This was the single most consequential of the twelve, since it's why the table itself kept showing backwards colors after the first "consolidation" pass.
-35. The country drawer's delta-arrow rendering — its own hardcoded `biw-delta-up`/`biw-delta-down` assignment, independent of the table's version.
-36. The "Top movers" summary-card widget — hardcoded `mover-up`/`mover-down` classes the same unoriented way.
-37. The map's own country-hover tooltip — used `bandLabels[band(score)]` directly while its color already correctly used `getColor(score)`, producing a tooltip whose label and color actively contradicted each other (reported live: Norway showing "Very Poor", Venezuela showing "Very Good").
-38. The donut chart's hover tooltip — same label/color mismatch pattern as the map tooltip.
-
-### Rank-movement and delta fixes
-39. `deltaHtml()` (table) and the drawer's delta rendering: wording changed from "Rank worsened (more vulnerable)" / "Rank improved (less vulnerable)" — backwards for a higher-is-better index — to fully orientation-neutral "Rank moved up, closer to #1" / "Rank moved down, further from #1", which needs no configuration at all.
-40. Delta arrow **color** made orientation-aware via `deltaColorClass()` — moving toward rank #1 is bad (red) for SIVI, good (green) for SERI. The arrow direction itself always reflects the real numeric movement regardless of orientation.
-
-### Partial-coverage rank display (shared bug, affects SIVI and SERI equally, not introduced this session)
-41. `rankHtml()` (table) and the drawer's rank display both used to prefer the client-side recomputed rank over the backend's partial-coverage range display — `getRecomputedRank()` always returns a number for any country with a score, so it silently overrode the honest-uncertainty range (`#38–52*`) for *every* partial-coverage country, making that feature effectively dead in the live view. Fixed: partial coverage now always shows its backend-provided range; full coverage still uses the recomputed rank as before.
-
-### Map marker fixes
-42. Marker selection (best/worst/biggest-mover) now excludes whichever countries are already used for best/worst when picking the mover, preventing a coincidental tie (very likely right after a full ranking inversion) from silently collapsing 3 markers to 2.
-43. **Root-caused and fixed the "still only 2 of 3 visible" follow-up report:** not a ranking-logic bug — the marker-placement code silently drops a marker if that specific country isn't present as its own polygon in the simplified world-map data (common for small territories; Macao SAR was the reported case). Fixed: selection now tries the best candidate first and falls back to the next-best by score/rank-change if the top choice has no placeable map feature, guaranteeing 3 actually-visible markers whenever the map data allows it.
-44. Map marker/pulse color changed from purple (`#9B59B6`) to cyan (`#22D3EE`) for better visibility against the red/yellow/green band-color choropleth.
-
-### Other fixes
-45. **Dark-mode-by-default bug:** `state.isDark` defaulted to `false` (light), but the CSS class needed to actually render light mode was only added when `localStorage` explicitly said `'light'` — a first-time visitor got dark mode from the base CSS despite the JS state saying otherwise. Fixed: light now applies unless `'dark'` was explicitly saved.
-46. Default `bandLabels` fallback changed from `"Low,Medium,High,Extreme"` to `"Very Good,Good,Poor,Very Poor"`.
-
-## `src/frontend/index-frontend-styles.css`
-
-### Label/color scheme redesign (final, user-confirmed design)
-Band labels changed from intensity-based ("Low"..."Extreme", which requires already knowing an index's direction to read as good or bad) to quality-based ("Very Good, Good, Poor, Very Poor" — always means the same thing regardless of index). This meant the label must now reverse together with the color for a higher-is-better index, unlike the old design where only color reversed.
-
-47. Renamed CSS custom properties: `--biw-low/medium/high/extreme` → `--biw-verygood/good/poor/verypoor` (all usages, including ones unrelated to score bands like DQI badges and comparison-series colors, which simply reference the same variables under their new names).
-48. Renamed the two class families structurally tied to the engine's JS output: `.biw-badge-low/medium/high/extreme` → `.biw-badge-verygood/good/poor/verypoor`; `.biw-risk-badge.low/medium/high/extreme` → `.biw-risk-badge.verygood/good/poor/verypoor`.
-49. Applied a corrected, genuinely monotonic color palette while renaming (the old `--biw-medium` at `#fac678` was measurably *brighter* than `--biw-high` at `#eb674e`, breaking the intended severity gradient — a pre-existing issue independent of orientation, affecting SIVI too): `verygood=#22c55e`, `good=#eab308`, `poor=#f97316`, `verypoor=#dc2626`, with matching `rgba()` background-tint values updated to match.
-50. Left deliberately unchanged: purely positional class names not tied to display text (histogram's `axis-band low/med/high/ext`), DQI/provenance quality dots, and comparison-series accent colors (these distinguish one series from another, not a score band).
-
----
-
-## Not changed this session (flagged, not fixed)
-
-- **SIVI/SERI cron-staleness mixing** — sources refresh on different days; SIVI (and now SERI) rebuild daily and mix different-day-freshness pillars across countries in the same composite. DQI disclosure is the only current mitigation. This is a methodology/product decision, not a code bug — left for the user/research side to decide.
-- **EIA and WB indicators** were not given the same time-budget safety net as HHI's stuck-running fix — worth doing if the same symptom is ever observed there.
-- **SERI historical backfill infrastructure** (per-year status table, year-specific fetchers, backfill cron, admin range UI matching SIVI's) does not exist yet — flagged as the next piece of work, not started.
-- **`blomstra-index-alerts.php`** was read and referenced but never modified.
-- **`sivi-backend.php`** had no net functional changes (only the reverted `<?php` addition).
-
-## Consequence for existing data
-
-SERI's pre-existing snapshots (August and September 2026) were built under the old, wrong-for-resilience polarity and read backwards relative to the new methodology. A fresh SERI rebuild after deployment is required for the composite/rank values to be consistent with the new methodology going forward; the historical snapshots from before the flip should be treated as using a different, incompatible methodology version (`< 5.0.0`) rather than being directly comparable to anything built under `5.0.0`.
-
 # Changelog — insights-wp Bug-Fix, Methodology & Historical Backfill Sessions
 
 **Base commit:** `fc46520e8585a34c03221bbba983e510dd77ba51` (branch `main`)
 **Scope (Session 1):** 8 files — `global-reference-data.php`, `blomstra-index-utilities.php`, `blomstra-index-alerts.php` (read only, no changes), `sivi-backend.php` (no functional changes), `sivi-shortcode.php`, `seri-backend.php`, `seri-shortcode.php`, `index-frontend-engine.js`, `index-frontend-styles.css`
 **Scope (Session 2):** 5 files — `seri-backend.php`, `seri-shortcode.php`, `sivi-shortcode.php`, `index-frontend-engine.js`, `global-reference-data.php` (one line)
+**Scope (Session 3):** 2 files — `sivi-backend.php` (3.3.0 → 3.5.0), `seri-backend.php` (5.4.0 → 5.5.0, one function)
 
 This document exists so the current live code can be diffed against the original GitHub baseline and every change accounted for. Grouped by file, in the order changes were made. Each entry states what changed and why.
 
@@ -296,3 +185,33 @@ SERI's pre-existing snapshots (August and September 2026) were built under the o
 
 - SERI snapshot rows for any year backfilled under `SERI_VERSION` `5.1.0` or `5.2.0` contain the undercounted data described in entry 3 above (the mrnev/date-range collapse) and should not be treated as representative — they will be cleanly overwritten by re-running the backfill (`🧹 Clear Cached Series & Reset` → `🔄 Warm Up Reference Data` → `📦 Backfill All Years`), since `blomstra_index_snapshot_save()` is keyed by index + year and idempotently replaces existing rows for that year.
 - No change to live SERI scoring, ranking, or methodology this session — `seri_build_composite()`'s actual pillar math is untouched; every fix above is in data assembly (what goes *into* scoring for a historical year) or in display (`data_freshness` shape, historical pillar lookups), not in the scoring logic itself.
+
+---
+
+# SESSION 3 — SIVI backfill robustness, and SIVI/SERI backfill-panel parity
+
+**Goal:** SIVI had none of the backfill robustness fixes found while building SERI's backfill, and its backfill admin panel looked and behaved differently from SERI's. SIVI is live and working, so every change was kept to the backfill code path only: no scoring, no generic builder, no live build, no pillar fetchers, and no REST endpoint was touched.
+
+## `src/indices/sivi/sivi-backend.php` — `SIVI_VERSION` `3.3.0` → `3.5.0`
+
+1. **[3.4.0, High] Single-year "Retry" ran inline in the admin page load.** `sivi_build_historical_snapshot()` was called synchronously inside the POST handler, so on a cold cache (live EIA/HHI/Maritime fetches) the admin page could go blank until it finished or was killed. Now scheduled in the background via `wp_schedule_single_event`, exactly as "Backfill All" always was.
+2. **[3.4.0, High] A killed backfill job left its year frozen forever.** `sivi_backfill_year_cron_callback()` only wrote a status after the build returned; a server-level timeout kills the process before PHP's own shutdown handling runs, so the year stayed on "Scheduled" with no error ever recorded. The callback now (a) checks reference-data readiness first via `sivi_backfill_sources_ready()`, reusing the EXISTING Historical Data Cache Manager job tracker in `global-reference-data.php` (`blomstra_cache_job_get_status()` / `blomstra_cache_job_update()` / the `blomstra_cache_historical_job` cron hook — no new cache or fetcher was built); (b) if EIA/Comtrade/Maritime is not yet cached for that exact year, queues those existing jobs for whichever are missing, marks the year `warming_up`, and reschedules itself 90 seconds later, capped at 40 attempts (~1 hour); (c) if a warm-up job itself reports `failed`, fails the year immediately naming the source instead of retrying forever; (d) marks the year `running` and wraps the actual build in a `register_shutdown_function()` safety net so a kill mid-build ends in `failed` with a message, never a silent freeze. Readiness checks the exact target year only and does not model each fetcher's own internal lookback — deliberately conservative: worst case is one extra, harmless warm-up job that finds the lookback-cached data already sufficient.
+3. **[3.4.0, Medium] `sivi_backfill_check_completion()` could not release the lock after a single-year Retry.** It required EVERY year in the configured range to be in a terminal state, so retrying one year while others were simply never attempted ('not_started') left the lock held until its 2-hour TTL. It now releases once nothing is actively in flight (no year `scheduled`, `running`, or `warming_up`).
+4. **[3.5.0, Medium] Gap in my own 3.4.0 change: Retry on a year whose warm-up job had `failed` failed again instantly, every time.** Nothing ever re-queued the failed job. Added `sivi_backfill_reset_failed_jobs()`: an admin clicking Retry / Backfill All / Warm Up now resets that year's FAILED warm-up job statuses to `not_started` so they are re-queued. Only job status rows are touched; cached data is never deleted. The cron callback itself still treats a failed job as a hard failure on purpose (it is what stops a broken source looping forever).
+5. **[3.5.0] Backfill admin panel brought to parity with SERI's.** The two separate panels ("Historical Backfill Range" and "Historical Backfill Status") are now one "📅 Historical Backfill" panel containing: a reference-data cache summary ("N of M source-years ready") with a per-year, per-source status drill-down (EIA / Comtrade HHI / Maritime LSCI) and a "🔄 Warm Up Reference Data" button; the range form (same field and nonce names as before); the status table, whose last column is now "Message" instead of "Error" because it also carries "Warming up" progress text, with "Run / Retry" for failed/partial/not-started years and a new "Rebuild" for finished years; "📦 Backfill All Years"; and a new "⏹️ Cancel and clear lock". "Warming up" years render in purple and offer no button. All four backfill actions (Backfill All, single-year, Warm Up, Cancel) moved out of `sivi_render_admin_page()` into `sivi_backfill_handle_actions()`, and the panel into `sivi_render_backfill_box()`, mirroring SERI's `seri_backfill_handle_actions()` / `seri_render_backfill_box()`. The `admin_init` range-save handler was left exactly as it was (verified by test: a valid range saves, start < 2004 is rejected).
+6. **Deliberately NOT added to SIVI:** SERI's "Purge ALL snapshot history" (SERI needed it once because its Aug/Sep snapshots predate a polarity flip; SIVI has no such problem and deleting working history is not something to hang on one button) and SERI's "Clear Cached Series & Reset" (SERI's cache was a private, rebuildable options cache; SIVI's lives in the shared `wp_blomstra_historical_data` table that the Reference Data page's Historical Data Cache Manager already manages, with its own Retry All Failed / Purge Empty EIA Cache / Clear All Statuses controls, and a destructive flush from SIVI's page would force hundreds of EIA calls to rebuild).
+
+## `src/indices/seri/seri-backend.php` — `SERI_VERSION` `5.4.0` → `5.5.0`
+
+7. **[Medium] `seri_backfill_check_completion()`: same lock-release bug as SIVI item 3.** Fixed identically (active states for SERI: `scheduled`, `running`). This was the only change to the file; a line-by-line diff against 5.4.0 shows only this function and the version markers. It had been described as "bundled" in an earlier delivery but was not actually applied until now.
+
+## Not changed in Session 3 (flagged)
+
+- **Scoring and data layers:** `sivi_build_composite()`, `sivi_build_historical_snapshot()`, `sivi_get_generic_config()`, the EIA/HHI/Maritime pillar refreshers, the auto-refresh cron, and the REST endpoint are byte-for-byte unchanged.
+- **Non-backfill admin differences remain, intentionally:** SIVI has Custom Composite Weights and Benchmark Correlation panels that SERI lacks; SERI has "Fetch API Direct", Emergency API, and Force Daily Cron controls that SIVI lacks (SIVI's pillars come only from the Reference Data caches). These follow from the two indices' different data architectures, not from drift. Unifying them belongs to the planned shared-framework work (extract always-async actions, warm-up-with-fail-fast, the status-table renderer and the DQI helper into `blomstra-index-utilities.php`), which has not started.
+- **Stuck cache job:** if a Historical Data Cache Manager job is killed while `running`, SIVI's readiness check treats it as in flight and the year ends as `failed` after the 40-attempt cap with a message pointing at the Reference Data page. It does not try to detect a stale `running` row (the job table's timestamps are site-local strings, so age-checking them reliably needs more care than this change warranted).
+- **Observation, not changed:** the live SIVI page currently shows "EIA data is still being fetched (fuel 1 of 5)". That comes from the existing `sivi_check_upstream_health()` reading the weekly EIA refresh pointer and is unrelated to the backfill code, but a pointer still on fuel 1 two days after its Tuesday schedule is worth a look on the Reference Data page.
+
+## Consequence for existing data (Session 3)
+
+None. No snapshot rows, caches, options, or job statuses are modified by deploying these two files. Existing SIVI snapshots (2020–2025) and SERI snapshots are untouched; the SIVI "Rebuild" button re-scores a year from already-cached data and overwrites that year's snapshot idempotently.
